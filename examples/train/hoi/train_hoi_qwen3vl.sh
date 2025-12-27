@@ -2,12 +2,27 @@
 # HOI Detection RL Training Script for Qwen3-VL
 # Based on pixel_reasoner training script with adaptations for HOI detection
 #
-# Usage:
+# Usage (8 GPUs - default):
+#   bash examples/train/hoi/train_hoi_qwen3vl.sh
+#
+# Usage (4 GPUs - H100 80GB recommended):
+#   N_GPUS=4 BATCH_SIZE=64 TP_SIZE=2 GPU_MEM_UTIL=0.7 DO_OFFLOAD=True \
+#   MAX_PROMPT_LEN=8192 MAX_RESPONSE_LEN=4096 MAX_BATCHED_TOKENS=8000 \
 #   bash examples/train/hoi/train_hoi_qwen3vl.sh
 #
 # Prerequisites:
 #   - Run data preparation first: python examples/data_preprocess/hoi/prepare_hoi.py
 #   - Install dependencies: pip install bert_score transformers
+#
+# GPU Memory Estimation (Qwen3-VL-4B):
+#   - Model weights (bf16): ~8GB
+#   - Optimizer states: ~16GB (sharded via FSDP)
+#   - KV cache (vLLM): ~20-40GB depending on sequence length
+#   - Activations: Variable
+#   
+#   For 4x H100 (80GB each = 320GB total):
+#   - Recommended: Use offloading and reduced sequence lengths
+#   - Expected memory usage: ~60-70GB per GPU
 
 set -x
 
@@ -23,17 +38,17 @@ model_name=Qwen/Qwen3-VL-4B-Instruct
 
 # RL algorithm configuration
 rl_alg=grpo  # grpo or gae(ppo)
-n_gpus_per_node=8
+n_gpus_per_node=${N_GPUS:-8}  # Set via env var: N_GPUS=4 for 4 GPUs
 n_nodes=1
 n=8  # Number of samples per prompt (for GRPO group normalization)
-batch_size=128
-ppo_mini_batch_size=128
+batch_size=${BATCH_SIZE:-128}  # Reduce for fewer GPUs: BATCH_SIZE=64
+ppo_mini_batch_size=${BATCH_SIZE:-128}
 
-# Sequence length configuration
-max_prompt_length=16384  # Should be large to avoid truncation of image tokens
-max_response_length=16384
+# Sequence length configuration - Adjust for memory constraints
+max_prompt_length=${MAX_PROMPT_LEN:-16384}  # Reduce if OOM: MAX_PROMPT_LEN=8192
+max_response_length=${MAX_RESPONSE_LEN:-8192}  # Reduced from 16384
 max_action_length=2048
-max_obs_length=8192
+max_obs_length= 4096  # Reduced from 4096 to 8192
 ppo_max_token_len_per_gpu=$(expr $max_prompt_length + $max_response_length)
 
 # Sampling configuration
@@ -59,16 +74,20 @@ reward_manager=hoi_reward  # Uses Binary IoU + Hybrid BERTScore
 # GPU and memory configuration
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-tensor_model_parallel_size=2
-gpu_memory_utilization=0.8
-do_offload=False
+# tensor_model_parallel_size: 
+#   - Use 2 for 8 GPUs (pairs of GPUs share model)
+#   - Use 1 for 4 GPUs (each GPU holds full model with FSDP)
+tensor_model_parallel_size=${TP_SIZE:-2}
+gpu_memory_utilization=${GPU_MEM_UTIL:-0.7}  # Reduced from 0.8 for stability
+# do_offload: Enable for 4 GPUs to reduce memory pressure
+do_offload=${DO_OFFLOAD:-False}
 use_dynamic_bsz=True
 ulysses_sequence_parallel_size=1
 fsdp_size=-1
 additional_eos_token_ids=[151645]  # <|im_end|> token id
 mask_observations=True
 enable_mtrl=True  # Enable multi-turn training
-max_num_batched_tokens=10000
+max_num_batched_tokens=${MAX_BATCHED_TOKENS:-10000}
 
 # Run name
 model_pretty_name=$(echo $model_name | tr '/' '_' | tr '[:upper:]' '[:lower:]')
