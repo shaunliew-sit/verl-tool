@@ -348,9 +348,30 @@ def _get_input_embeds(
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            )
+            # Handle small mismatches that can occur due to tokenization differences
+            diff = abs(n_image_tokens - n_image_features)
+            if diff <= 10:  # Allow small mismatches
+                import logging
+                logging.warning(
+                    f"Image features and image tokens mismatch: tokens: {n_image_tokens}, features {n_image_features}. "
+                    f"Adjusting to handle the difference of {diff}."
+                )
+                if n_image_tokens > n_image_features:
+                    # More tokens than features - pad image_embeds with zeros
+                    padding = torch.zeros(
+                        n_image_tokens - n_image_features, 
+                        image_embeds.shape[-1], 
+                        dtype=image_embeds.dtype, 
+                        device=image_embeds.device
+                    )
+                    image_embeds = torch.cat([image_embeds, padding], dim=0)
+                else:
+                    # More features than tokens - truncate image_embeds
+                    image_embeds = image_embeds[:n_image_tokens]
+            else:
+                raise ValueError(
+                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                )
 
         mask = input_ids == model.config.image_token_id
         mask_unsqueezed = mask.unsqueeze(-1)

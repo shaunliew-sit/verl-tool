@@ -236,10 +236,16 @@ def extract_boxes_from_response(response_str: str) -> List[List[float]]:
                 for item in data:
                     if isinstance(item, dict) and 'bbox_2d' in item:
                         box = item['bbox_2d']
-                        if isinstance(box, list) and len(box) == 4:
-                            boxes.append([float(x) for x in box])
-                    elif isinstance(item, list) and len(item) == 4:
-                        boxes.append([float(x) for x in item])
+                        if isinstance(box, list) and len(box) == 4 and all(x is not None for x in box):
+                            try:
+                                boxes.append([float(x) for x in box])
+                            except (TypeError, ValueError):
+                                pass  # Skip invalid boxes
+                    elif isinstance(item, list) and len(item) == 4 and all(x is not None for x in item):
+                        try:
+                            boxes.append([float(x) for x in item])
+                        except (TypeError, ValueError):
+                            pass  # Skip invalid boxes
     except (json.JSONDecodeError, ValueError):
         pass
     
@@ -477,6 +483,8 @@ class HOIRewardManagerV2:
                 score['grounding_score'] = task_score
                 score['referring_score'] = 0.0  # Not applicable for grounding
                 score['verb_match'] = 1.0  # N/A for grounding
+                score['match_type'] = 'grounding'  # N/A for grounding
+                score['extracted_phrase'] = ''  # N/A for grounding
                 
             else:  # referring
                 # Ground truth is action phrase string

@@ -17,6 +17,8 @@ dependencies = [
     "func_timeout",
     "aiofiles",
     "click==8.2.1",
+    "flashinfer-python>=0.5.3",
+    "boto3>=1.42.19",
 ]
 
 [tool.setuptools]

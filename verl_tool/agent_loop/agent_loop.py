@@ -739,10 +739,14 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        reward_extra_keys.sort()
+        # Collect all unique keys from all reward_extra_infos (not just the first one)
+        reward_extra_keys = set()
+        for info in reward_extra_infos:
+            reward_extra_keys.update(info.keys())
+        reward_extra_keys = sorted(list(reward_extra_keys))
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            # Use .get() with None as default for missing keys
+            non_tensor_batch[key] = np.array([info.get(key, None) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

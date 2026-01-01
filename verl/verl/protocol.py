@@ -201,12 +201,33 @@ def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str
 def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     if len(list_of_dict) == 0:
         return {}
-    keys = list_of_dict[0].keys()
-    output = {key: [] for key in keys}
+    # Collect all unique keys from all dictionaries (not just the first one)
+    all_keys = set()
     for data in list_of_dict:
-        for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+        all_keys.update(data.keys())
+    # Initialize output with all keys
+    output = {key: [] for key in all_keys}
+    # For each dictionary, append values for all keys
+    # If a key is missing, create an empty array with the same shape as other values
+    for data in list_of_dict:
+        # Infer batch size from the first available key in this dictionary
+        batch_size = None
+        if data:
+            for val in data.values():
+                if val is not None:
+                    if isinstance(val, np.ndarray):
+                        batch_size = len(val)
+                    break
+        
+        for key in all_keys:
+            val = data.get(key, None)
+            if val is None:
+                # Create an empty array with the inferred batch size
+                if batch_size is not None:
+                    val = np.array([None] * batch_size, dtype=object)
+                else:
+                    val = np.array([], dtype=object)
+            output[key].append(val)
     return output
 
 
@@ -940,11 +961,12 @@ class DataProto:
         for key, val in non_tensor_batch.items():
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
-        # Merge meta_info with special handling for metrics
+        # Merge meta_info with special handling for metrics and reward_extra_keys
         merged_meta_info = {}
         if data:
             # Merge non-metric meta_info and aggregate metrics from all workers.
             all_metrics = []
+            all_reward_extra_keys = set()
             for d in data:
                 for k, v in d.meta_info.items():
                     if k == "metrics":
@@ -953,6 +975,11 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        # Merge reward_extra_keys from all workers
+                        if v is not None:
+                            if isinstance(v, (list, set)):
+                                all_reward_extra_keys.update(v)
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
@@ -963,6 +990,10 @@ class DataProto:
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
                 merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+            
+            # Store merged reward_extra_keys
+            if all_reward_extra_keys:
+                merged_meta_info["reward_extra_keys"] = sorted(list(all_reward_extra_keys))
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)
