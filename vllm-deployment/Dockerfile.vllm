@@ -1,0 +1,47 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.cargo/bin:$PATH"
+# Set CUDA compatibility library path (CRITICAL for PTX compatibility)
+# This allows CUDA 12.9 PTX code to run on CUDA 12.4 driver
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.9/compat:$LD_LIBRARY_PATH
+
+# Update and install essential packages
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    python3-venv \
+    pipx \
+    git \
+    vim \
+    htop \
+    cuda-compat-12-9 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager)
+# uv will be used to create venv and install vLLM interactively
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Set working directory
+WORKDIR /workspace
+# Default command - keep container running with bash for interactive use
+# User can exec in and set up vLLM interactively:
+# docker exec -it vllm-server bash
+# 
+# Setup venv and install vLLM:
+# uv venv --python 3.12 --seed
+# source .venv/bin/activate
+# uv pip install vllm --torch-backend=auto
+#
+# Then run vLLM with any model and parameters:
+# CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3-VL-8B-Instruct --host 0.0.0.0 --port 8000 --tensor-parallel-size 1 --limit-mm-per-prompt video 0 --async-scheduling
+# Or switch to different models:
+# vllm serve Qwen/Qwen2.5-VL-7B-Instruct --host 0.0.0.0 --port 8000
+# vllm serve google/gemma-7b-it --host 0.0.0.0 --port 8000
+# Note: All GPUs are available by default. Use CUDA_VISIBLE_DEVICES=X to limit to specific GPU if needed.
+# Default command
+CMD ["/bin/bash"]
