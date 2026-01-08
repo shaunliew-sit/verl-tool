@@ -5,6 +5,8 @@ Upload training checkpoints to AWS S3.
 Usage:
     python scripts/upload_to_s3.py --checkpoint-dir ./checkpoints/hoi_reward_v2/hoi_reward_v2-fsdp2-agent-qwen_qwen3-vl-4b-instruct-grpo-n8-b128-t1.0-lr5e-7-hoi-detection-v2 --bucket hoi-dataset --prefix checkpoints-new/
 
+    #upload the hoi_cof_sft dataset
+    python scripts/upload_to_s3.py --checkpoint-dir ./data/hoi_cof_sft --bucket hoi-dataset --prefix data/
 Environment Variables (or use AWS CLI profile):
     AWS_ACCESS_KEY_ID: Your AWS access key
     AWS_SECRET_ACCESS_KEY: Your AWS secret key

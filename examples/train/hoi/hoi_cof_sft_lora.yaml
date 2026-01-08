@@ -1,0 +1,71 @@
+# HOI Chain-of-Focus SFT Training Configuration
+# Model: Qwen3-VL-8B-Instruct with LoRA
+# Dataset: hoi_cof_sft (5k samples with tool-calling and direct answers)
+
+### model
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+# Image settings optimized for COCO images (~640x480)
+# 1048576 = 1024x1024, sufficient for HOI detection
+image_max_pixels: 1048576
+image_min_pixels: 12544      # 112x112 minimum
+video_max_pixels: 16384
+trust_remote_code: true
+
+# Performance optimizations
+flash_attn: fa2
+enable_liger_kernel: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 64                # Higher rank for tool-use learning
+lora_alpha: 128              # 2x rank for stable training
+lora_dropout: 0.05
+lora_target: all
+
+# Freeze settings (following Chain-of-Focus approach)
+freeze_vision_tower: true              # Keep vision encoder frozen
+freeze_multi_modal_projector: false    # Train projector for grounding
+freeze_language_model: false           # Train LM for tool format
+
+### dataset
+dataset: hoi_cof_sft
+dataset_dir: data/hoi_cof_sft
+template: qwen3_vl_nothink           # Use qwen3_vl for no thinking mode
+cutoff_len: 8192             # Longer context for multi-turn tool calling
+overwrite_cache: true
+preprocessing_num_workers: 32         # Increased for 8 GPUs
+dataloader_num_workers: 8             # Increased for 8 GPUs
+
+### output
+output_dir: saves/qwen3-vl-8b/lora/hoi_cof_sft
+logging_steps: 5                       # More frequent logging for short training
+save_steps: 50                         # More frequent saves (~234 total steps)
+save_total_limit: 10
+save_strategy: steps
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+
+### train (optimized for 8 GPUs)
+per_device_train_batch_size: 2         # Increased for multi-GPU
+gradient_accumulation_steps: 4         # Effective batch = 2*4*8 = 64
+learning_rate: 2.0e-5                  # Good for LoRA fine-tuning
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+weight_decay: 0.01
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+### eval
+val_size: 0.05                         # 5% for validation (~250 samples)
+per_device_eval_batch_size: 2          # Increased for multi-GPU
+eval_strategy: steps
+eval_steps: 50                         # More frequent eval for short training
+
+### logging
+report_to: wandb
+run_name: hoi-cof-sft-8b-lora64
