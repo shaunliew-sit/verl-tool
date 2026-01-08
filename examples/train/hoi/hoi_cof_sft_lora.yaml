@@ -31,7 +31,8 @@ freeze_language_model: false           # Train LM for tool format
 
 ### dataset
 dataset: hoi_cof_sft
-dataset_dir: data/hoi_cof_sft
+dataset_dir: /workspace/verl-tool/data/hoi_cof_sft
+media_dir: /workspace/verl-tool/data/hoi_cof_sft/images
 template: qwen3_vl_nothink           # Use qwen3_vl for no thinking mode
 cutoff_len: 8192             # Longer context for multi-turn tool calling
 overwrite_cache: true

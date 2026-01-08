@@ -21,9 +21,28 @@ CONFIG_FILE="$SCRIPT_DIR/hoi_cof_sft_lora.yaml"
 NUM_GPUS=8
 MASTER_PORT=29500
 
+# Clean up any existing training processes to avoid port conflicts
+echo "Checking for existing training processes..."
+if pgrep -f "torchrun|llamafactory" > /dev/null 2>&1; then
+    echo "Found existing training processes. Cleaning up..."
+    pkill -9 -f "torchrun|llamafactory" 2>/dev/null || true
+    sleep 3
+    echo "Cleanup complete."
+else
+    echo "No existing processes found."
+fi
+
+# Check if the master port is available
+if lsof -i :$MASTER_PORT > /dev/null 2>&1; then
+    echo "Warning: Port $MASTER_PORT is in use. Trying alternative port..."
+    MASTER_PORT=$((MASTER_PORT + 100))
+    echo "Using port: $MASTER_PORT"
+fi
+
 # Environment setup
 export DISABLE_VERSION_CHECK=1
 export PYTHONPATH="$PROJECT_ROOT/src:$PYTHONPATH"
+export MASTER_PORT=$MASTER_PORT  # LlamaFactory reads this for distributed training
 
 # Verify config exists
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -51,18 +70,24 @@ echo "Config: $CONFIG_FILE"
 echo "Dataset: $DATASET_DIR"
 echo "Working Dir: $PROJECT_ROOT"
 echo "GPUs: $NUM_GPUS"
+echo "Master Port: $MASTER_PORT"
 echo "Log File: $LOG_FOLDER/train-hoi-cof-sft-8b-lora.log"
 echo "Start Time: $(date)"
 echo "============================================"
 echo ""
 
-# Change to project root so relative paths work
-cd "$PROJECT_ROOT"
+# Change to LlamaFactory directory where the module is installed
+cd "$PROJECT_ROOT/LlamaFactory"
 
-# Multi-GPU training with torchrun
+# Activate virtual environment if it exists
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
+
+# Multi-GPU training - let LlamaFactory handle distributed launching internally
+# DO NOT use torchrun here - llamafactory.cli has its own launcher that spawns torchrun
 echo "Starting 8-GPU training... (logs saved to $LOG_FOLDER/train-hoi-cof-sft-8b-lora.log)"
-torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
-    -m llamafactory.cli train "$CONFIG_FILE" > "$LOG_FOLDER/train-hoi-cof-sft-8b-lora.log" 2>&1 &
+python -m llamafactory.cli train "$CONFIG_FILE" > "$LOG_FOLDER/train-hoi-cof-sft-8b-lora.log" 2>&1 &
 
 wait
 

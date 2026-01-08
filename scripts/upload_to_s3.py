@@ -7,6 +7,8 @@ Usage:
 
     #upload the hoi_cof_sft dataset
     python scripts/upload_to_s3.py --checkpoint-dir ./data/hoi_cof_sft --bucket hoi-dataset --prefix data/
+    #upload the sft checkpoint
+    python scripts/upload_to_s3.py --checkpoint-dir ./saves/qwen3-vl-8b/lora/hoi_cof_sft --bucket hoi-dataset --prefix saves/qwen3-vl-8b/lora/hoi_cof_sft/
 Environment Variables (or use AWS CLI profile):
     AWS_ACCESS_KEY_ID: Your AWS access key
     AWS_SECRET_ACCESS_KEY: Your AWS secret key
