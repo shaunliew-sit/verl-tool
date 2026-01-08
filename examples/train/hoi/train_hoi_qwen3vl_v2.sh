@@ -126,7 +126,7 @@ python -m verl_tool.servers.serve --host $host --port $port --tool_type "hoi_det
 server_pid=$!
 
 echo "Tool Server (pid=$server_pid) started at $tool_server_url"
-echo "Using HOI Detector tools: zoom_in, zoom_out, detect_objects"
+echo "Using HOI Detector tool: zoom_in (aligned with SFT/Chain-of-Focus)"
 echo ""
 echo "===== V2 Training with Verb-First Scoring ====="
 echo "Key improvements:"

@@ -47,28 +47,33 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Dict, Any, List, Optional
 
-# System prompt with tool definitions (based on pixel_reasoner format)
-SYSTEM_PROMPT = """You are a helpful assistant for Human-Object Interaction detection.
+# =============================================================================
+# System Prompt - Aligned with SFT data (Chain-of-Focus style)
+# Only zoom_in tool - matching generate_hoi_cof_sft.py
+# =============================================================================
+SYSTEM_PROMPT = """You are a helpful assistant.
 
 # Tools
-
 You may call one or more functions to assist with the user query.
-
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{"type": "function", "function": {"name": "zoom_in", "description": "Zoom in on a specific region of the image to examine details.", "parameters": {"type": "object", "properties": {"bbox_2d": {"type": "array", "description": "Bounding box coordinates [x1, y1, x2, y2] in 1000x1000 normalized format.", "items": {"type": "number"}}, "target_image": {"type": "number", "description": "The index of the image to zoom in on. Use 1 for the main image."}}, "required": ["bbox_2d", "target_image"]}}}
-{"type": "function", "function": {"name": "zoom_out", "description": "Reset the view to the original full image.", "parameters": {"type": "object", "properties": {"target_image": {"type": "number", "description": "The index of the image to reset. Use 1 for the main image."}}, "required": ["target_image"]}}}
-{"type": "function", "function": {"name": "detect_objects", "description": "Detect objects in the image using Grounding DINO.", "parameters": {"type": "object", "properties": {"class_names": {"type": "string", "description": "Object classes to detect, separated by ' . ' (e.g., 'person . cup . chair')."}, "target_image": {"type": "number", "description": "The index of the image to analyze. Use 1 for the main image."}, "confidence_threshold": {"type": "number", "description": "Minimum confidence for detections (0.0-1.0). Default: 0.25"}}, "required": ["class_names", "target_image"]}}}
+{"type": "function", "function": {"name":"zoom_in","description":"Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d). Coordinates use 1000x1000 normalized format.","parameters":{"properties":{"bbox_2d":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"The bounding box of the region to zoom in, as [x1, y1, x2, y2] in 1000x1000 normalized format, where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."},"target_image":{"type":"number","description":"The index of the image to zoom in on. Use 1 for the main image."}},"required":["bbox_2d", "target_image"], "type":"object"},"args_format": "Format the arguments as a JSON object."}}
 </tools>
 
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+For the function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
 
-GROUNDING_GUIDELINE = """Guidelines: Analyze the image to locate human-object interaction pairs. You may use zoom_in to examine details or detect_objects to find candidates. For each person-object pair, output bounding boxes in JSON format: [{"bbox_2d": [x1, y1, x2, y2], "label": "description"}, ...]. Coordinates should be in the 1000x1000 normalized format."""
+# User instruction suffix - aligned with SFT data
+USER_INSTRUCTION_SUFFIX = "Think in the mind first, and then decide whether to call tools one or more times OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."
 
-REFERRING_GUIDELINE = """Guidelines: Analyze the provided bounding boxes to determine what action the person is performing with the object. You may use zoom_in to examine interaction details. Output only the action phrase (e.g., "riding bicycle", "sitting on bench"). Use base verb form without articles."""
+# Guidelines aligned with SFT format
+GROUNDING_GUIDELINE = f"""For each person-object pair, output bbox coordinates in JSON format like: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}. Coordinates should be in 1000x1000 normalized format.
+{USER_INSTRUCTION_SUFFIX}"""
+
+REFERRING_GUIDELINE = f"""Respond with ONLY the action phrase in format: "{{verb}} {{object}}" (e.g., "riding bicycle", "holding cup"). Use base verb form, no articles.
+{USER_INSTRUCTION_SUFFIX}"""
 
 # Image directory mapping
 IMAGE_DIRS = {
@@ -151,19 +156,14 @@ def process_grounding_sample(sample: Dict[str, Any], dataset_type: str, split: s
             sample.get('height', 1000)
         )
     
-    # Handle both formats
-    if 'query' in sample:
-        # Simplified format with pre-built query/response
-        query = sample['query']
+    # Get action and object category
+    action = sample.get('action', 'interacting with')
+    object_category = sample.get('object_category', 'object')
+    
+    # Handle response
+    if 'response' in sample:
         response = sample['response']
     else:
-        # Raw format - build query and response
-        action = sample.get('action', 'interacting with')
-        object_category = sample.get('object_category', 'object')
-        num_pairs = sample.get('num_pairs', 1)
-        
-        query = f'Locate every person who is {action} {object_category} and the {object_category} they interact with in this image. For each person-object pair, output bbox coordinates in JSON format like: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}'
-        
         # Build response from boxes (alternating person/object)
         gt_box_inds = sample.get('gt_box_inds', list(range(len(boxes_1000))))
         response_items = []
@@ -178,8 +178,9 @@ def process_grounding_sample(sample: Dict[str, Any], dataset_type: str, split: s
                     response_items.append({"bbox_2d": boxes_1000[object_idx], "label": object_category})
         response = json.dumps(response_items)
     
-    # Build user content
-    user_content = f"<image>{query}\n\n{GROUNDING_GUIDELINE}"
+    # Build user content - aligned with SFT format
+    query = f"Question: Locate every person who is {action} {object_category} and the {object_category} they interact with."
+    user_content = f"<image> {query}\n{GROUNDING_GUIDELINE}"
     
     # Keep ground truth as string (JSON) for consistency
     ground_truth = response if isinstance(response, str) else json.dumps(response)
@@ -236,26 +237,23 @@ def process_referring_sample(sample: Dict[str, Any], dataset_type: str, split: s
             sample.get('height', 1000)
         )
     
-    # Handle both formats
-    if 'query' in sample:
-        # Simplified format with pre-built query/response
-        query = sample['query']
+    # Get box indices and response
+    person_box_idx = sample.get('person_box_idx', 0)
+    object_box_idx = sample.get('object_box_idx', 1)
+    
+    # Get boxes
+    person_box = boxes_1000[person_box_idx] if person_box_idx < len(boxes_1000) else [0, 0, 1000, 1000]
+    object_box = boxes_1000[object_box_idx] if object_box_idx < len(boxes_1000) else [0, 0, 1000, 1000]
+    
+    # Get response (action phrase)
+    if 'response' in sample:
         response = sample['response']
     else:
-        # Raw format - build query and response
-        person_box_idx = sample.get('person_box_idx', 0)
-        object_box_idx = sample.get('object_box_idx', 1)
-        gt_action = sample.get('gt_action', '')
-        
-        # Get boxes
-        person_box = boxes_1000[person_box_idx] if person_box_idx < len(boxes_1000) else [0, 0, 1000, 1000]
-        object_box = boxes_1000[object_box_idx] if object_box_idx < len(boxes_1000) else [0, 0, 1000, 1000]
-        
-        query = f'Action Recognition Task: The first region {{"bbox_2d": {person_box}, "label": "person"}} contains a PERSON. The second region {{"bbox_2d": {object_box}, "label": "object"}} contains an OBJECT. Describe the action the person is performing with this object. Respond with only the action phrase (e.g., "riding bicycle", "sitting on bench").'
-        response = gt_action
+        response = sample.get('gt_action', '')
     
-    # Build user content
-    user_content = f"<image>{query}\n\n{REFERRING_GUIDELINE}"
+    # Build user content - aligned with SFT format
+    query = f"Question: What action is the person performing with the object?\nThe person is located at {person_box} and the object is at {object_box}."
+    user_content = f"<image> {query}\n{REFERRING_GUIDELINE}"
     
     return {
         "data_source": f"{dataset_type}_det",

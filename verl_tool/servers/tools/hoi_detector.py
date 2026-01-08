@@ -299,15 +299,16 @@ class HOIDetectorTool(BaseTool):
     """
     HOI Detector Tool for Human-Object Interaction Detection.
     
-    Provides three tools:
-    - zoom_in: Zoom into a specific region of the image
-    - zoom_out: Reset to the original image view
-    - detect_objects: Object detection using Grounding DINO
+    Aligned with Chain-of-Focus methodology - provides only zoom_in tool:
+    - zoom_in: Zoom into a specific region of the image to examine details
+    
+    Note: zoom_out and detect_objects removed to align with SFT training data.
     """
     tool_type = "hoi_detector"
 
     stop_tokens = ["</tool_call>"]
-    valid_mcp_func_names = ['zoom_in', 'zoom_out', 'detect_objects', 'crop_image']
+    # Only zoom_in supported - aligned with SFT/Chain-of-Focus
+    valid_mcp_func_names = ['zoom_in', 'crop_image']
 
     def __init__(self, num_workers=1):
         super().__init__(num_workers)
@@ -317,10 +318,8 @@ class HOIDetectorTool(BaseTool):
         )
 
     def get_usage_inst(self):
-        return """HOI Detection tools:
-- zoom_in: Zoom into a region. Args: bbox_2d=[x1,y1,x2,y2], target_image=1
-- zoom_out: Reset to original image. Args: target_image=1
-- detect_objects: Detect objects. Args: class_names="person . object", target_image=1"""
+        return """HOI Detection tool (Chain-of-Focus aligned):
+- zoom_in: Zoom into a region to examine details. Args: bbox_2d=[x1,y1,x2,y2], target_image=1"""
     
     def parse_action(self, action: str) -> Tuple[str, bool]:
         """
