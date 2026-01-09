@@ -70,9 +70,48 @@ from tqdm.asyncio import tqdm_asyncio
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Setup logging - will be configured with file handler in main()
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(output_dir: str, log_filename: str = "eval.log") -> str:
+    """
+    Setup logging to both console and file.
+    
+    Args:
+        output_dir: Directory to save the log file
+        log_filename: Name of the log file
+    
+    Returns:
+        Path to the log file
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    log_path = os.path.join(output_dir, log_filename)
+    
+    # Clear any existing handlers
+    root_logger = logging.getLogger()
+    root_logger.handlers = []
+    
+    # Set root logger level
+    root_logger.setLevel(logging.INFO)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_format)
+    root_logger.addHandler(console_handler)
+    
+    # File handler - captures everything
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_format)
+    root_logger.addHandler(file_handler)
+    
+    return log_path
 
 
 # =============================================================================
@@ -1452,6 +1491,10 @@ async def run_grounding_evaluation(args):
             logger.warning("wandb not available")
     
     logger.info(f"\nResults saved to {args.output_dir}/")
+    logger.info(f"Log file: {os.path.join(args.output_dir, 'eval.log')}")
+    logger.info("=" * 60)
+    logger.info("Grounding Evaluation Complete")
+    logger.info("=" * 60)
     return metrics
 
 
@@ -1559,6 +1602,10 @@ async def run_referring_evaluation(args):
             logger.warning("wandb not available")
     
     logger.info(f"\nResults saved to {args.output_dir}/")
+    logger.info(f"Log file: {os.path.join(args.output_dir, 'eval.log')}")
+    logger.info("=" * 60)
+    logger.info("Referring Evaluation Complete")
+    logger.info("=" * 60)
     return metrics
 
 
@@ -1629,6 +1676,21 @@ def main():
     # Apply unique output directory if enabled
     if args.unique_run:
         args.output_dir = get_unique_output_dir(args.output_dir)
+    
+    # Setup logging BEFORE any other operations
+    log_path = setup_logging(args.output_dir)
+    
+    # Log startup information
+    logger.info("=" * 80)
+    logger.info("HOI Agent Evaluation - Session Started")
+    logger.info("=" * 80)
+    logger.info(f"Log file: {log_path}")
+    logger.info(f"Timestamp: {datetime.now().isoformat()}")
+    logger.info("")
+    logger.info("Configuration:")
+    for key, value in sorted(vars(args).items()):
+        logger.info(f"  {key}: {value}")
+    logger.info("=" * 80)
     
     # Auto-enable save_viz when verbose is set
     if args.verbose and not args.save_viz:

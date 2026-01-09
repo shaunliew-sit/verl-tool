@@ -19,6 +19,7 @@
 #   UNIQUE_RUN    - Append timestamp to output dir (default: true)
 #   WANDB         - Enable W&B logging (default: false)
 #   OUTPUT_DIR    - Output directory (default: results/hico_ground_agent)
+#   LOG_DIR       - Directory for backup logs (default: logs)
 
 set -e
 
@@ -32,6 +33,14 @@ SAVE_VIZ="${SAVE_VIZ:-false}"
 UNIQUE_RUN="${UNIQUE_RUN:-true}"
 WANDB="${WANDB:-false}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/hico_ground_agent}"
+LOG_DIR="${LOG_DIR:-logs}"
+
+# Create logs directory
+mkdir -p "$LOG_DIR"
+
+# Generate log filename with timestamp
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="${LOG_DIR}/eval-hico-ground-${TIMESTAMP}.log"
 
 # Dataset paths
 ANN_FILE="data/benchmarks_simplified/hico_ground_test_simplified.json"
@@ -83,13 +92,29 @@ fi
 
 echo ""
 echo "Running: $CMD"
+echo "Log file: $LOG_FILE"
 echo ""
 
-eval $CMD
+# Run command and tee output to log file
+eval $CMD 2>&1 | tee -a "$LOG_FILE"
+EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
 echo "=============================================="
 echo "Evaluation complete!"
 echo "Results saved to: $OUTPUT_DIR"
+echo "Log file: $LOG_FILE"
 echo "=============================================="
+
+# Also append final summary to log
+{
+    echo ""
+    echo "=============================================="
+    echo "Evaluation complete at $(date)"
+    echo "Exit code: $EXIT_CODE"
+    echo "Results saved to: $OUTPUT_DIR"
+    echo "=============================================="
+} >> "$LOG_FILE"
+
+exit $EXIT_CODE
 
