@@ -34,13 +34,11 @@ SYSTEM_PROMPT = """You are a helpful assistant for Human-Object Interaction dete
 
 # Tools
 
-You may call one or more functions to assist with the user query.
+You may call functions to assist with the user query if needed.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
 {"type": "function", "function": {"name": "zoom_in", "description": "Zoom in on a specific region of the image to examine details.", "parameters": {"type": "object", "properties": {"bbox_2d": {"type": "array", "description": "Bounding box coordinates [x1, y1, x2, y2] in 1000x1000 normalized format.", "items": {"type": "number"}}, "target_image": {"type": "number", "description": "The index of the image to zoom in on. Use 1 for the main image."}}, "required": ["bbox_2d", "target_image"]}}}
-{"type": "function", "function": {"name": "zoom_out", "description": "Reset the view to the original full image.", "parameters": {"type": "object", "properties": {"target_image": {"type": "number", "description": "The index of the image to reset. Use 1 for the main image."}}, "required": ["target_image"]}}}
-{"type": "function", "function": {"name": "detect_objects", "description": "Detect objects in the image using Grounding DINO.", "parameters": {"type": "object", "properties": {"class_names": {"type": "string", "description": "Object classes to detect, separated by ' . ' (e.g., 'person . cup . chair')."}, "target_image": {"type": "number", "description": "The index of the image to analyze. Use 1 for the main image."}, "confidence_threshold": {"type": "number", "description": "Minimum confidence for detections (0.0-1.0). Default: 0.25"}}, "required": ["class_names", "target_image"]}}}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -81,7 +79,7 @@ def build_grounding_prompt(action: str, object_label: str = "object"):
     """Build grounding task prompt matching training format."""
     return f"""Object Grounding Task: Find the person and {object_label} that are involved in the action "{action}".
 
-Guidelines: Detect objects using detect_objects tool if needed. Output bounding boxes in format: [{{"bbox_2d": [x1, y1, x2, y2], "label": "person"}}, {{"bbox_2d": [x1, y1, x2, y2], "label": "{object_label}"}}]"""
+Guidelines: You may use zoom_in to examine details if needed. Output bounding boxes in format: [{{"bbox_2d": [x1, y1, x2, y2], "label": "person"}}, {{"bbox_2d": [x1, y1, x2, y2], "label": "{object_label}"}}]"""
 
 
 def parse_tool_calls(response: str) -> List[Dict]:

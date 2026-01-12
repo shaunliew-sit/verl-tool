@@ -146,31 +146,6 @@ TOOL_DEFINITIONS = [
                 "required": ["bbox"]
             }
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "zoom_out",
-            "description": "Zoom out to see the full image.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "detect_objects",
-            "description": "Detect objects in the current image view using Grounding DINO.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Object categories to detect, separated by ' . '"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
     }
 ]
 
@@ -178,13 +153,11 @@ SYSTEM_PROMPT = """You are a helpful assistant for Human-Object Interaction dete
 
 # Tools
 
-You may call one or more functions to assist with the user query.
+You may call functions to assist with the user query if needed.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
 {"type": "function", "function": {"name": "zoom_in", "description": "Zoom in on a specific region of the image to examine details.", "parameters": {"type": "object", "properties": {"bbox_2d": {"type": "array", "description": "Bounding box coordinates [x1, y1, x2, y2] in 1000x1000 normalized format.", "items": {"type": "number"}}, "target_image": {"type": "number", "description": "The index of the image to zoom in on. Use 1 for the main image."}}, "required": ["bbox_2d", "target_image"]}}}
-{"type": "function", "function": {"name": "zoom_out", "description": "Reset the view to the original full image.", "parameters": {"type": "object", "properties": {"target_image": {"type": "number", "description": "The index of the image to reset. Use 1 for the main image."}}, "required": ["target_image"]}}}
-{"type": "function", "function": {"name": "detect_objects", "description": "Detect objects in the image using Grounding DINO.", "parameters": {"type": "object", "properties": {"class_names": {"type": "string", "description": "Object classes to detect, separated by ' . ' (e.g., 'person . cup . chair')."}, "target_image": {"type": "number", "description": "The index of the image to analyze. Use 1 for the main image."}, "confidence_threshold": {"type": "number", "description": "Minimum confidence for detections (0.0-1.0). Default: 0.25"}}, "required": ["class_names", "target_image"]}}}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -192,7 +165,7 @@ For each function call, return a json object with function name and arguments wi
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>
 
-Think in the mind first, and then decide whether to call tools one or more times OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
+Think in the mind first, and then decide whether to call tools if needed OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
 
 
 # =============================================================================
@@ -315,9 +288,9 @@ For each interaction found, output the bounding boxes for:
 
 Output format: List of {{"bbox_2d": [x1, y1, x2, y2], "label": "person/object"}} pairs.
 
-Guidelines: Analyze the image to locate human-object interaction pairs. You may use zoom_in to examine details or detect_objects to find candidates. For each person-object pair performing "{action}", output their bounding boxes in JSON format. Coordinates should be in the 1000x1000 normalized format.
+Guidelines: Analyze the image to locate human-object interaction pairs. You may use zoom_in to examine details if needed. For each person-object pair performing "{action}", output their bounding boxes in JSON format. Coordinates should be in the 1000x1000 normalized format.
 
-Think in the mind first, and then decide whether to call tools one or more times OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
+Think in the mind first, and then decide whether to call tools if needed OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
 
 
 def build_referring_prompt(person_box: List[int], object_box: List[int], 
@@ -337,9 +310,9 @@ def build_referring_prompt(person_box: List[int], object_box: List[int],
     
     return f"""Action Recognition Task: The first region {{"bbox_2d": {person_norm}, "label": "person"}} contains a PERSON. The second region {{"bbox_2d": {object_norm}, "label": "{object_category}"}} contains an OBJECT. Describe the action the person is performing with this object. Respond with only the action phrase (e.g., "riding bicycle", "sitting on bench").
 
-Guidelines: Analyze the provided bounding boxes to determine what action the person is performing with the object. You may use zoom_in to examine interaction details. Output only the action phrase (e.g., "riding bicycle", "sitting on bench"). Use base verb form without articles.
+Guidelines: Analyze the provided bounding boxes to determine what action the person is performing with the object. You may use zoom_in to examine interaction details if needed. Output only the action phrase (e.g., "riding bicycle", "sitting on bench"). Use base verb form without articles.
 
-Think in the mind first, and then decide whether to call tools one or more times OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
+Think in the mind first, and then decide whether to call tools if needed OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
 
 
 # =============================================================================
