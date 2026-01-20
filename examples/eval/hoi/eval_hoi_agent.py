@@ -547,8 +547,8 @@ class HOIAgentEvaluator:
             should_close = True
         
         # Retry logic for server disconnections
-        max_retries = 3
-        retry_delay = 2  # seconds
+        max_retries = 5
+        retry_delay = 1  # seconds (with exponential backoff: 1, 2, 3, 4, 5s)
         last_error = None
         
         try:
