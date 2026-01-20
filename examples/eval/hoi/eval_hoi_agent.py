@@ -137,13 +137,55 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "bbox": {
+                    "bbox_2d": {
                         "type": "array",
                         "items": {"type": "number"},
-                        "description": "Bounding box [x1, y1, x2, y2] in pixel coordinates"
+                        "description": "Bounding box [x1, y1, x2, y2] in 1000x1000 normalized format"
+                    },
+                    "target_image": {
+                        "type": "number",
+                        "description": "The index of the image to zoom in on. Use 1 for the main image."
                     }
                 },
-                "required": ["bbox"]
+                "required": ["bbox_2d", "target_image"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "zoom_out",
+            "description": "Reset the view to the original full image.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_image": {
+                        "type": "number",
+                        "description": "The index of the image to reset. Use 1 for the main image."
+                    }
+                },
+                "required": ["target_image"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_objects",
+            "description": "Detect objects in the image using Grounding DINO.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "class_names": {
+                        "type": "string",
+                        "description": "Classes to detect, separated by ' . ' (e.g., 'person . cup')"
+                    },
+                    "target_image": {
+                        "type": "number",
+                        "description": "The index of the image to detect objects in. Use 1 for the main image."
+                    }
+                },
+                "required": ["class_names", "target_image"]
             }
         }
     }
@@ -153,11 +195,13 @@ SYSTEM_PROMPT = """You are a helpful assistant for Human-Object Interaction dete
 
 # Tools
 
-You may call functions to assist with the user query if needed.
+You may call one or more functions to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
 {"type": "function", "function": {"name": "zoom_in", "description": "Zoom in on a specific region of the image to examine details.", "parameters": {"type": "object", "properties": {"bbox_2d": {"type": "array", "description": "Bounding box coordinates [x1, y1, x2, y2] in 1000x1000 normalized format.", "items": {"type": "number"}}, "target_image": {"type": "number", "description": "The index of the image to zoom in on. Use 1 for the main image."}}, "required": ["bbox_2d", "target_image"]}}}
+{"type": "function", "function": {"name": "zoom_out", "description": "Reset the view to the original full image.", "parameters": {"type": "object", "properties": {"target_image": {"type": "number", "description": "The index of the image to reset. Use 1 for the main image."}}, "required": ["target_image"]}}}
+{"type": "function", "function": {"name": "detect_objects", "description": "Detect objects in the image using Grounding DINO.", "parameters": {"type": "object", "properties": {"class_names": {"type": "string", "description": "Classes to detect, separated by ' . ' (e.g., 'person . cup')"}, "target_image": {"type": "number", "description": "The index of the image to detect objects in. Use 1 for the main image."}}, "required": ["class_names", "target_image"]}}}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -356,6 +400,108 @@ class HOIAgentEvaluator:
         image.save(buffered, format="JPEG", quality=85)
         return base64.b64encode(buffered.getvalue()).decode('utf-8')
     
+    def _run_grounding_dino(self, image: Image.Image, query: str, box_threshold: float = 0.3, text_threshold: float = 0.25) -> List[Dict]:
+        """Run Grounding DINO object detection on image.
+        
+        Args:
+            image: PIL Image
+            query: Classes to detect separated by ' . ' (e.g., 'person . cup')
+            box_threshold: Confidence threshold for boxes
+            text_threshold: Confidence threshold for text matching
+            
+        Returns:
+            List of detections with label, bbox, confidence
+        """
+        try:
+            from groundingdino.util.inference import load_model, load_image, predict
+            import torch
+            import numpy as np
+            import tempfile
+            import os
+            
+            # Initialize model if not cached
+            if not hasattr(self, '_grounding_dino_model'):
+                # Try to find model weights
+                model_paths = [
+                    "/workspace/verl-tool/checkpoints/groundingdino_swint_ogc.pth",
+                    os.path.expanduser("~/.cache/groundingdino/groundingdino_swint_ogc.pth"),
+                    "/tmp/groundingdino_swint_ogc.pth"
+                ]
+                config_path = None
+                weights_path = None
+                
+                # Find groundingdino config
+                import groundingdino
+                gd_path = os.path.dirname(groundingdino.__file__)
+                config_path = os.path.join(gd_path, "config", "GroundingDINO_SwinT_OGC.py")
+                
+                for path in model_paths:
+                    if os.path.exists(path):
+                        weights_path = path
+                        break
+                
+                if weights_path is None:
+                    # Download weights
+                    import urllib.request
+                    weights_path = "/tmp/groundingdino_swint_ogc.pth"
+                    url = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+                    logger.info(f"Downloading Grounding DINO weights to {weights_path}...")
+                    urllib.request.urlretrieve(url, weights_path)
+                
+                self._grounding_dino_model = load_model(config_path, weights_path)
+                # Force CPU if CUDA not available
+                if not torch.cuda.is_available():
+                    self._grounding_dino_model = self._grounding_dino_model.cpu()
+                    logger.info("Grounding DINO model loaded (CPU mode)")
+                else:
+                    logger.info("Grounding DINO model loaded (GPU mode)")
+            
+            # Save image temporarily
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                image.save(f, format='JPEG')
+                temp_path = f.name
+            
+            try:
+                # Load and predict
+                image_source, image_tensor = load_image(temp_path)
+                # Ensure tensor is on same device as model
+                device = next(self._grounding_dino_model.parameters()).device
+                image_tensor = image_tensor.to(device)
+                boxes, logits, phrases = predict(
+                    model=self._grounding_dino_model,
+                    image=image_tensor,
+                    caption=query,
+                    box_threshold=box_threshold,
+                    text_threshold=text_threshold,
+                    device=str(device)
+                )
+                
+                # Convert to output format
+                detections = []
+                h, w = image_source.shape[:2]
+                for box, logit, phrase in zip(boxes, logits, phrases):
+                    # Convert normalized coords to pixel coords
+                    cx, cy, bw, bh = box.tolist()
+                    x1 = int((cx - bw/2) * w)
+                    y1 = int((cy - bh/2) * h)
+                    x2 = int((cx + bw/2) * w)
+                    y2 = int((cy + bh/2) * h)
+                    
+                    detections.append({
+                        'label': phrase,
+                        'bbox': [x1, y1, x2, y2],
+                        'confidence': float(logit)
+                    })
+                
+                return detections
+            finally:
+                os.unlink(temp_path)
+                
+        except ImportError as e:
+            raise RuntimeError(f"Grounding DINO not available: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Detection error: {e}")
+    
     async def call_model(self, messages: List[Dict], images: List[Image.Image] = None,
                          session: aiohttp.ClientSession = None) -> Dict:
         """Call the vLLM server with messages and optional images."""
@@ -380,23 +526,16 @@ class HOIAgentEvaluator:
                     images_added = True
                 formatted_messages.append({'role': 'user', 'content': content})
             elif msg['role'] == 'assistant':
+                # Don't include tool_calls - model uses XML-style tags in content
                 formatted_messages.append({
                     'role': 'assistant',
-                    'content': msg.get('content', ''),
-                    'tool_calls': msg.get('tool_calls')
-                })
-            elif msg['role'] == 'tool':
-                formatted_messages.append({
-                    'role': 'tool',
-                    'tool_call_id': msg.get('tool_call_id', ''),
-                    'content': msg['content']
+                    'content': msg.get('content', '')
                 })
         
         payload = {
             'model': self.model_name,
             'messages': formatted_messages,
-            'tools': TOOL_DEFINITIONS,
-            'tool_choice': 'auto',
+            # Note: NOT using vLLM native tool calling - model uses XML-style <tool_call> tags in text
             'max_tokens': self.max_tokens,
             'temperature': 0.7,
             'repetition_penalty': 1.1,
@@ -407,16 +546,31 @@ class HOIAgentEvaluator:
             session = aiohttp.ClientSession()
             should_close = True
         
+        # Retry logic for server disconnections
+        max_retries = 3
+        retry_delay = 2  # seconds
+        last_error = None
+        
         try:
-            async with session.post(
-                f"{self.endpoint}/chat/completions",
-                json=payload,
-                headers={'Content-Type': 'application/json'}
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise Exception(f"API error {response.status}: {error_text}")
-                return await response.json()
+            for attempt in range(max_retries):
+                try:
+                    async with session.post(
+                        f"{self.endpoint}/chat/completions",
+                        json=payload,
+                        headers={'Content-Type': 'application/json'},
+                        timeout=aiohttp.ClientTimeout(total=120)  # 2 minute timeout
+                    ) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            raise Exception(f"API error {response.status}: {error_text}")
+                        return await response.json()
+                except (aiohttp.ServerDisconnectedError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Retry {attempt + 1}/{max_retries} after error: {e}")
+                        await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    else:
+                        raise Exception(f"Server disconnected after {max_retries} retries: {e}")
         finally:
             if should_close:
                 await session.close()
@@ -426,9 +580,14 @@ class HOIAgentEvaluator:
         if tool_name == 'zoom_in':
             bbox = arguments.get('bbox', arguments.get('bbox_2d', []))
             if len(bbox) == 4:
-                x1, y1, x2, y2 = [int(c) for c in bbox]
-                # Ensure valid crop region
+                x1_norm, y1_norm, x2_norm, y2_norm = [float(c) for c in bbox]
+                # Convert from 1000x1000 normalized format to actual pixel coordinates
                 w, h = state.current_image.size
+                x1 = int(x1_norm * w / 1000)
+                y1 = int(y1_norm * h / 1000)
+                x2 = int(x2_norm * w / 1000)
+                y2 = int(y2_norm * h / 1000)
+                # Ensure valid crop region
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 if x2 > x1 and y2 > y1:
@@ -446,8 +605,7 @@ class HOIAgentEvaluator:
         elif tool_name == 'detect_objects':
             query = arguments.get('query', arguments.get('class_names', 'person . object'))
             try:
-                from verl_tool.servers.tools.hoi_detector import detect_objects_with_grounding_dino
-                detections = detect_objects_with_grounding_dino(state.current_image, query)
+                detections = self._run_grounding_dino(state.current_image, query)
                 if detections:
                     result = "Detected objects:\n"
                     for det in detections:
@@ -546,12 +704,14 @@ class HOIAgentEvaluator:
                     break
             
             if tool_calls:
+                # Add assistant response as plain text (not using vLLM native tool calling)
                 state.messages.append({
                     'role': 'assistant',
-                    'content': content,
-                    'tool_calls': tool_calls
+                    'content': content
                 })
                 
+                # Execute tools and collect results
+                tool_results = []
                 for tc in tool_calls:
                     func = tc.get('function', {})
                     tool_name = func.get('name', '')
@@ -567,13 +727,14 @@ class HOIAgentEvaluator:
                         'args': arguments,
                         'result': result
                     })
-                    
-                    state.messages.append({
-                        'role': 'tool',
-                        'tool_call_id': tc.get('id', ''),
-                        'name': tool_name,
-                        'content': result
-                    })
+                    tool_results.append(f"[{tool_name}] {result}")
+                
+                # Add tool results as user message (not using role: 'tool')
+                tool_output = "\n".join(tool_results)
+                state.messages.append({
+                    'role': 'user',
+                    'content': f"Tool output:\n{tool_output}\n\nContinue your analysis. If you have enough information, provide your final answer. Format: <think>...</think> <answer>...</answer>"
+                })
             else:
                 final_response = content
                 state.messages.append({'role': 'assistant', 'content': content})
@@ -658,29 +819,51 @@ def convert_normalized_to_pixel(boxes: List[Dict], img_width: int, img_height: i
     return boxes
 
 
-def extract_boxes_from_response(response: str) -> List[Dict]:
-    """Extract bounding boxes from model response."""
+def extract_boxes_from_response(response: str, max_boxes: int = 20) -> List[Dict]:
+    """Extract bounding boxes from model response.
+    
+    Args:
+        response: Model response text
+        max_boxes: Maximum number of boxes to extract (prevents repetitive generation issues)
+    
+    Returns:
+        List of boxes with bbox_2d and label
+    """
     boxes = []
+    
+    # First, try to extract content from <answer>...</answer> tags
+    answer_match = re.search(r'<answer>\s*(.*?)\s*</answer>', response, re.DOTALL)
+    search_text = answer_match.group(1) if answer_match else response
     
     # Pattern for {"bbox_2d": [...], "label": "..."}
     pattern = r'\{\s*"bbox_2d"\s*:\s*\[([^\]]+)\]\s*,\s*"label"\s*:\s*"([^"]+)"\s*\}'
-    matches = re.findall(pattern, response)
+    matches = re.findall(pattern, search_text)
     
     for coords_str, label in matches:
+        if len(boxes) >= max_boxes:
+            break
         try:
             coords = [int(float(x.strip())) for x in coords_str.split(',')]
             if len(coords) == 4:
-                boxes.append({"bbox_2d": coords, "label": label.lower()})
+                x1, y1, x2, y2 = coords
+                # Filter invalid boxes (x2 must > x1, y2 must > y1, coords in valid range)
+                if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0 and x2 <= 1100 and y2 <= 1100:
+                    boxes.append({"bbox_2d": coords, "label": label.lower()})
         except:
             continue
     
     # Fallback: try to find [x1, y1, x2, y2] patterns
     if not boxes:
         bbox_pattern = r'\[(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\]'
-        bbox_matches = re.findall(bbox_pattern, response)
+        bbox_matches = re.findall(bbox_pattern, search_text)
         for i, (x1, y1, x2, y2) in enumerate(bbox_matches):
-            label = "person" if i % 2 == 0 else "object"
-            boxes.append({"bbox_2d": [int(x1), int(y1), int(x2), int(y2)], "label": label})
+            if len(boxes) >= max_boxes:
+                break
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            # Filter invalid boxes
+            if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0 and x2 <= 1100 and y2 <= 1100:
+                label = "person" if i % 2 == 0 else "object"
+                boxes.append({"bbox_2d": [x1, y1, x2, y2], "label": label})
     
     return boxes
 
