@@ -110,20 +110,47 @@ class TaskRunner:
         self.mapping = {}
 
     def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker based on the actor strategy."""
+        """Add actor rollout worker based on the actor strategy.
+        
+        If use_spatial_linking is enabled in the model config, spatial linking
+        workers will be used instead of the standard workers.
+        """
         from verl.single_controller.ray import RayWorkerGroup
 
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+        # Check if spatial linking is enabled
+        use_spatial_linking = config.actor_rollout_ref.model.get("use_spatial_linking", False)
 
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
+        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+            if use_spatial_linking:
+                # Use spatial linking workers
+                from verl_tool.workers.spatial_fsdp_workers import (
+                    SpatialActorRolloutRefWorker,
+                    SpatialAsyncActorRolloutRefWorker,
+                )
+                print("[main_ppo] Using SpatialActorRolloutRefWorker with spatial linking support")
+                
+                actor_rollout_cls = (
+                    SpatialAsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else SpatialActorRolloutRefWorker
+                )
+            else:
+                # Use standard workers
+                from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+
+                actor_rollout_cls = (
+                    AsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else ActorRolloutRefWorker
+                )
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
+            if use_spatial_linking:
+                raise NotImplementedError(
+                    "Spatial linking is not yet supported with Megatron strategy. "
+                    "Please use FSDP strategy for spatial linking models."
+                )
             from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
 
             actor_rollout_cls = (

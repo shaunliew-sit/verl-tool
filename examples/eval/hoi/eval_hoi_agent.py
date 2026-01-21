@@ -1108,12 +1108,15 @@ def compute_referring_metrics(predictions: List[Dict], bertscore_gpu: int = 0) -
         
         if valid_pairs:
             preds, refs = zip(*valid_pairs)
+            # Use DeBERTa-v2-xxlarge-mnli for better semantic understanding
+            # Note: No baseline rescaling available for this model, but scores
+            # are consistent across experiments using the same configuration
             P, R, F1 = bert_score(
                 list(preds), list(refs),
-                model_type="roberta-large",
+                model_type="microsoft/deberta-v2-xxlarge-mnli",
                 lang="en",
-                batch_size=64,
-                rescale_with_baseline=True,
+                batch_size=32,  # Reduced batch size for larger model
+                rescale_with_baseline=False,  # No baseline available for deberta-v2-xxlarge
                 verbose=False
             )
             

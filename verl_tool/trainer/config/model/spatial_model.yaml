@@ -4,10 +4,13 @@
 # 3. Inline comments (after a field on the same line) are not allowed.
 # 4. Indentation level is respected for nested fields.
 
+# Spatial Linking Model Configuration for GRPO Training
+# Extends the base HF model config with spatial linking options
+
 _target_: verl.workers.config.HFModelConfig
 
-# path to the huggingface model
-path: ~/models/deepseek-llm-7b-chat
+# path to the huggingface model (e.g., Qwen/Qwen3-VL-8B-Instruct)
+path: ~/models/qwen3-vl-8b-instruct
 
 # config to the huggingface config. In case it is not the same as path
 hf_config_path: null
@@ -19,7 +22,7 @@ tokenizer_path: null
 use_shm: False
 
 # whether to trust remote code.
-trust_remote_code: False
+trust_remote_code: True
 
 # custom chat template for the model
 custom_chat_template: null
@@ -39,11 +42,11 @@ enable_activation_offload: False
 # whether to use remove padding. Only valid when we use hf model definition
 use_remove_padding: False
 
-# Set to positive value to enable LoRA (e.g., 32)
-lora_rank: 0
+# Set to positive value to enable LoRA (e.g., 64 for spatial linking)
+lora_rank: 64
 
 # LoRA scaling factor
-lora_alpha: 16
+lora_alpha: 128
 
 # Target modules for LoRA adaptation
 target_modules: all-linear
@@ -62,20 +65,19 @@ use_fused_kernels: False
 
 # fused kernel options.
 fused_kernel_options:
-
   # the implementation backend for fused kernels.
   impl_backend: torch
 
 # ============================================================================
-# Spatial Linking Configuration (for SpatialLinkingInteractionModel support)
+# Spatial Linking Configuration (New fields for spatial linking support)
 # ============================================================================
 
-# Whether to use SpatialLinkingInteractionModel instead of standard model
-# When enabled, requires refer_boxes in training data
+# Whether to use SpatialLinkingInteractionModel instead of standard Qwen3-VL
 use_spatial_linking: False
 
 # Path to pre-trained spatial linking weights checkpoint
-# If provided, spatial linking module weights will be loaded from this path
+# If provided, the spatial linking module weights will be loaded from this path
+# Format: path to .pt or .safetensors file containing spatial_linking state_dict
 spatial_linking_checkpoint: null
 
 # Whether to freeze the spatial linking module during RL training
@@ -84,4 +86,5 @@ spatial_linking_checkpoint: null
 freeze_spatial_linking: False
 
 # Whether to freeze the vision tower during training
-freeze_vision_tower: False
+# Recommended: True to save memory and maintain vision representations
+freeze_vision_tower: True
