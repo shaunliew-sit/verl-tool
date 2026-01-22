@@ -46,6 +46,11 @@
 
 set -x
 
+# Add spatial_linking_training to Python path for Ray workers
+# This is required because Ray workers don't inherit sys.path modifications
+export PYTHONPATH="${PYTHONPATH:-}:/workspace/spatial_linking_training"
+export SPATIAL_LINKING_PATH="/workspace/spatial_linking_training"
+
 # Dataset configuration
 # NOTE: Use multi-tool spatial-enabled dataset with refer_boxes column
 dataset_name=${DATASET_NAME:-hoi/train_data_multitool}
@@ -79,14 +84,14 @@ rl_alg=grpo  # grpo or gae(ppo)
 n_gpus_per_node=${N_GPUS:-8}  # Set via env var: N_GPUS=4 for 4 GPUs
 n_nodes=1
 n=8  # Number of samples per prompt (for GRPO group normalization)
-batch_size=${BATCH_SIZE:-128}  # Reduce for fewer GPUs: BATCH_SIZE=64
-ppo_mini_batch_size=${BATCH_SIZE:-128}
+batch_size=${BATCH_SIZE:-64}  # Reduced from 128 to prevent OOM with vision models
+ppo_mini_batch_size=${BATCH_SIZE:-64}
 
-# Sequence length configuration - Adjust for memory constraints
-max_prompt_length=${MAX_PROMPT_LEN:-16384}  # Reduce if OOM: MAX_PROMPT_LEN=8192
-max_response_length=${MAX_RESPONSE_LEN:-8192}
+# Sequence length configuration - Adjusted for memory constraints
+max_prompt_length=${MAX_PROMPT_LEN:-8192}  # Reduced from 16384 to prevent OOM
+max_response_length=${MAX_RESPONSE_LEN:-4096}  # Reduced from 8192 to prevent OOM
 max_action_length=2048
-max_obs_length=4096
+max_obs_length=2048  # Reduced from 4096
 ppo_max_token_len_per_gpu=$(expr $max_prompt_length + $max_response_length)
 
 # Sampling configuration
@@ -107,18 +112,24 @@ kl_loss_type=low_var_kl
 lr=5e-7
 
 # LoRA configuration (important for spatial linking training)
+# Note: Use specific language model modules instead of all-linear because
+# vLLM only supports LoRA on language model layers, not vision encoder
 lora_rank=${LORA_RANK:-64}
 lora_alpha=${LORA_ALPHA:-128}
-target_modules=${TARGET_MODULES:-all-linear}
+# Qwen3-VL language model layers (attention + MLP)
+# Note: For vLLM compatibility, only target language model layers (not vision encoder)
+# Format follows Hydra list syntax like trainer.logger=['console','wandb']
+target_modules=${TARGET_MODULES:-"['q_proj','k_proj','v_proj','o_proj','gate_proj','up_proj','down_proj']"}
 
 # Reward manager
 reward_manager=hoi_reward_v2
 
 # GPU and memory configuration
+# Reduced memory settings to prevent OOM during multimodal embedding operations
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
 tensor_model_parallel_size=${TP_SIZE:-2}
-gpu_memory_utilization=${GPU_MEM_UTIL:-0.7}
+gpu_memory_utilization=${GPU_MEM_UTIL:-0.70}  # Balanced setting for GPU memory utilization
 do_offload=${DO_OFFLOAD:-False}
 use_dynamic_bsz=True
 ulysses_sequence_parallel_size=1
@@ -126,7 +137,9 @@ fsdp_size=-1
 additional_eos_token_ids=[151645]  # <|im_end|> token id
 mask_observations=True
 enable_mtrl=True
-max_num_batched_tokens=${MAX_BATCHED_TOKENS:-10000}
+max_num_batched_tokens=${MAX_BATCHED_TOKENS:-6144}  # Increased from 4096 for better throughput
+max_num_seqs=${MAX_NUM_SEQS:-128}  # Keep at 128 to limit concurrent sequences
+max_concurrent_trajectories=${MAX_CONCURRENT_TRAJ:-96}  # Increased from 64 for better parallelism
 
 # Run name
 model_pretty_name=$(echo $model_name | tr '/' '_' | tr '[:upper:]' '[:lower:]')
@@ -247,7 +260,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     actor_rollout_ref.agent.action_stop_tokens=$action_stop_tokens_file \
     actor_rollout_ref.agent.enable_mtrl=$enable_mtrl \
     actor_rollout_ref.agent.max_action_length=$max_action_length \
-    actor_rollout_ref.agent.max_concurrent_trajectories=128 \
+    actor_rollout_ref.agent.max_concurrent_trajectories=$max_concurrent_trajectories \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$tensor_model_parallel_size \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
     actor_rollout_ref.rollout.enforce_eager=True \
@@ -259,9 +272,10 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.n=$n \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$use_dynamic_bsz \
-    actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.max_num_seqs=$max_num_seqs \
     actor_rollout_ref.rollout.mode=$rollout_mode \
     actor_rollout_ref.rollout.max_num_batched_tokens=$max_num_batched_tokens \
+    actor_rollout_ref.rollout.disable_rollout_lora=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=$use_dynamic_bsz \
     actor_rollout_ref.ref.fsdp_config.param_offload=$do_offload \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \

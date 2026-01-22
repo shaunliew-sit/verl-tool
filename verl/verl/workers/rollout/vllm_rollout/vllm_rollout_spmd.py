@@ -147,9 +147,15 @@ class vLLMRollout(BaseRollout):
         else:
             lora_rank = model_config.lora_rank
 
+        # Check disable_rollout_lora to skip LoRA in vLLM (useful for multimodal models
+        # where vLLM LoRA support is limited)
+        self.disable_rollout_lora = getattr(config, "disable_rollout_lora", False)
+        if model_config.lora_rank > 0 and self.disable_rollout_lora:
+            logger.info("LoRA disabled for vLLM rollout (disable_rollout_lora=True). "
+                        "Training FSDP will still use LoRA.")
         self.lora_kwargs = (
             {"enable_lora": True, "max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(lora_rank)}
-            if model_config.lora_rank > 0
+            if model_config.lora_rank > 0 and not self.disable_rollout_lora
             else {}
         )
 
@@ -477,7 +483,7 @@ class vLLMRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
-        if peft_config and base_sync_done:
+        if peft_config and base_sync_done and not self.disable_rollout_lora:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_reqest = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",
@@ -493,6 +499,34 @@ class vLLMRollout(BaseRollout):
 
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
+            # When disable_rollout_lora=True, FSDP still has LoRA wrappers with .base_layer. in names,
+            # and PEFT adds base_model.model. prefix. vLLM expects HuggingFace naming.
+            # PEFT names: base_model.model.model.language_model... -> HF names: model.language_model...
+            # Strip base_model.model. prefix (not just base_model.) and .base_layer. infix.
+            # Also filter out spatial_linking weights since vLLM uses the base model without this module.
+            if self.disable_rollout_lora:
+                def transform_weight_name_sync(name):
+                    # Strip PEFT's base_model.model. prefix to get HuggingFace naming
+                    if name.startswith("base_model.model."):
+                        name = name[len("base_model.model."):]
+                    # Strip .base_layer. infix from LoRA-wrapped layers
+                    name = name.replace(".base_layer.", ".")
+                    return name
+                
+                def should_skip_weight_sync(name):
+                    # Skip spatial_linking weights (not in vLLM model)
+                    if name.startswith("spatial_linking.") or name.startswith("base_model.model.spatial_linking."):
+                        return True
+                    # Skip LoRA adapter weights (lora_A, lora_B) - only sync base weights
+                    if ".lora_A." in name or ".lora_B." in name or ".lora_embedding_A." in name or ".lora_embedding_B." in name:
+                        return True
+                    return False
+                
+                weights = (
+                    (transform_weight_name_sync(name), param) 
+                    for name, param in weights 
+                    if not should_skip_weight_sync(name)
+                )
             model.load_weights(weights)
 
 
@@ -525,9 +559,11 @@ class vLLMAsyncRollout(BaseRollout):
         self.tokenizer = model_config.tokenizer
         self.inference_engine: WorkerWrapperBase = None
         self.address = self._init_zeromq()
+        # Check disable_rollout_lora to skip LoRA in vLLM (useful for multimodal models)
+        self.disable_rollout_lora = getattr(config, "disable_rollout_lora", False)
         self.lora_config = (
             {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(model_config.lora_rank)}
-            if model_config.lora_rank > 0
+            if model_config.lora_rank > 0 and not self.disable_rollout_lora
             else {}
         )
 
@@ -631,7 +667,7 @@ class vLLMAsyncRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
-        if peft_config and base_sync_done:
+        if peft_config and base_sync_done and not self.disable_rollout_lora:
             # In async mode, make sure the old lora is removed before adding the new one
             self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
             lora_request = TensorLoRARequest(
@@ -648,6 +684,46 @@ class vLLMAsyncRollout(BaseRollout):
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
+            # When disable_rollout_lora=True, FSDP still has LoRA wrappers with .base_layer. in names,
+            # and PEFT adds base_model.model. prefix. vLLM expects HuggingFace naming.
+            # PEFT names: base_model.model.model.language_model... -> HF names: model.language_model...
+            # Strip base_model.model. prefix (not just base_model.) and .base_layer. infix.
+            # Also filter out spatial_linking weights since vLLM uses the base model without this module.
+            if self.disable_rollout_lora:
+                def transform_weight_name_async(name):
+                    # Strip PEFT's base_model.model. prefix to get HuggingFace naming
+                    if name.startswith("base_model.model."):
+                        name = name[len("base_model.model."):]
+                    # Strip .base_layer. infix from LoRA-wrapped layers
+                    name = name.replace(".base_layer.", ".")
+                    return name
+                
+                def should_skip_weight_async(name):
+                    # Skip spatial_linking weights (not in vLLM model)
+                    if name.startswith("spatial_linking.") or name.startswith("base_model.model.spatial_linking."):
+                        return True
+                    # Skip LoRA adapter weights (lora_A, lora_B) - only sync base weights
+                    if ".lora_A." in name or ".lora_B." in name or ".lora_embedding_A." in name or ".lora_embedding_B." in name:
+                        return True
+                    return False
+                
+                # #region agent log - Track weight filtering for LoRA exclusion
+                import json as _json
+                _debug_stats = {"skipped_lora": [], "skipped_spatial": [], "loaded_count": 0}
+                def _filter_and_transform(weights_iter):
+                    for name, param in weights_iter:
+                        if name.startswith("spatial_linking.") or name.startswith("base_model.model.spatial_linking."):
+                            _debug_stats["skipped_spatial"].append(name[:80])
+                        elif ".lora_A." in name or ".lora_B." in name or ".lora_embedding_A." in name or ".lora_embedding_B." in name:
+                            _debug_stats["skipped_lora"].append(name[:80])
+                        else:
+                            _debug_stats["loaded_count"] += 1
+                            yield (transform_weight_name_async(name), param)
+                    with open("/workspace/.cursor/debug.log", "a") as _f:
+                        _f.write(_json.dumps({"location": "vllm_rollout_spmd.py:update_weights_async", "hypothesisId": "LORA_FILTER", "message": "Weight filtering complete", "data": {"skipped_lora_count": len(_debug_stats["skipped_lora"]), "skipped_spatial_count": len(_debug_stats["skipped_spatial"]), "loaded_count": _debug_stats["loaded_count"], "sample_skipped_lora": _debug_stats["skipped_lora"][:5], "sample_skipped_spatial": _debug_stats["skipped_spatial"][:3]}, "timestamp": __import__("time").time()}) + "\n")
+                # #endregion
+                
+                weights = _filter_and_transform(weights)
             model.load_weights(weights)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:

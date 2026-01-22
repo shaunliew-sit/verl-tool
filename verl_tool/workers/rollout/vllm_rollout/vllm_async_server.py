@@ -73,7 +73,8 @@ class VerlToolvLLMHttpServer(vLLMHttpServerBase):
 
         # Add lora request
         lora_request = None
-        if self.model_config.lora_rank > 0:
+        disable_rollout_lora = getattr(self.config, 'disable_rollout_lora', False)
+        if self.model_config.lora_rank > 0 and not disable_rollout_lora:
             # Make sure we also check that the lora is already loaded in the engine
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
             if lora_loaded:

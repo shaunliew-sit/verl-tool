@@ -178,6 +178,10 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    # Disable LoRA in vLLM/sglang rollout. Useful for multimodal models where
+    # vLLM LoRA support is limited. Training FSDP will still use LoRA.
+    disable_rollout_lora: bool = False
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:

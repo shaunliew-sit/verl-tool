@@ -258,8 +258,10 @@ class SpatialActorRolloutRefWorker(ActorRolloutRefWorker):
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
         
         # Handle vision tower freezing
+        # Check both model and actor config for freeze_vision_tower
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
-        if self.config.actor.get("freeze_vision_tower", False):
+        freeze_vision = self.config.model.get("freeze_vision_tower", False) or self.config.actor.get("freeze_vision_tower", False)
+        if freeze_vision:
             vision_tower = get_vl_model_vision_tower(actor_module)
             if vision_tower is not None:
                 vision_tower.requires_grad_(False)
@@ -295,6 +297,7 @@ class SpatialActorRolloutRefWorker(ActorRolloutRefWorker):
             get_shard_placement_fn,
             MixedPrecisionPolicy,
             CPUOffloadPolicy,
+            init_fn,
         )
         from verl.workers.config.optimizer import build_optimizer
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
@@ -311,6 +314,7 @@ class SpatialActorRolloutRefWorker(ActorRolloutRefWorker):
             fsdp_mesh = self.device_mesh["fsdp"]
         
         # Apply FSDP
+        from verl.utils.device import get_device_id
         if fsdp_strategy == "fsdp":
             # FSDP1 implementation
             from torch.distributed.fsdp import CPUOffload
@@ -318,7 +322,7 @@ class SpatialActorRolloutRefWorker(ActorRolloutRefWorker):
             sharding_strategy = ShardingStrategy.FULL_SHARD if self.device_mesh.ndim == 1 else ShardingStrategy.HYBRID_SHARD
             mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
             
-            auto_wrap_policy = get_fsdp_wrap_policy(model=actor_module, config=fsdp_config.get("wrap_policy", {}))
+            auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get("wrap_policy", {}))
             cpu_offload = None
             if fsdp_config.get("offload_policy", False):
                 cpu_offload = CPUOffload(offload_params=True)
@@ -326,15 +330,16 @@ class SpatialActorRolloutRefWorker(ActorRolloutRefWorker):
             
             actor_module_fsdp = FSDP(
                 actor_module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
                 auto_wrap_policy=auto_wrap_policy,
-                device_id=self.local_rank,
+                device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
                 use_orig_params=self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
-                cpu_offload=cpu_offload,
             )
         elif fsdp_strategy == "fsdp2":
             # FSDP2 implementation
@@ -359,14 +364,41 @@ class SpatialActorRolloutRefWorker(ActorRolloutRefWorker):
         else:
             raise ValueError(f"Unknown FSDP strategy: {fsdp_strategy}")
         
-        # Build optimizer and scheduler
-        actor_optimizer = None
-        actor_lr_scheduler = None
-        if optim_config is not None:
-            actor_optimizer, actor_lr_scheduler = build_optimizer(
-                model=actor_module_fsdp,
-                optim_config=optim_config,
-            )
+        # Build optimizer and scheduler (matching parent class pattern)
+        if role == "actor" and optim_config is not None:
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+
+            total_steps = optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+            if self.rank == 0:
+                print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
+
+            if lr_scheduler_type == "constant":
+                actor_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "cosine":
+                actor_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
+        else:
+            actor_optimizer = None
+            actor_lr_scheduler = None
         
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 

@@ -427,6 +427,26 @@ def qwen3_vl_base_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
+    # #region agent log - Hypothesis A: Check if inputs_embeds already provided
+    import json as _json
+    _log_data = {"input_ids_is_none": input_ids is None, "inputs_embeds_in_kwargs": "inputs_embeds" in kwargs, "kwargs_keys": list(kwargs.keys())}
+    with open("/workspace/.cursor/debug.log", "a") as _f:
+        _f.write(_json.dumps({"location": "qwen3_vl.py:qwen3_vl_base_forward:entry", "hypothesisId": "A", "message": "base_forward entry", "data": _log_data, "timestamp": __import__("time").time()}) + "\n")
+    # #endregion
+
+    # If inputs_embeds is already provided (e.g., from SpatialLinkingInteractionModel),
+    # skip the embedding computation and use them directly
+    if "inputs_embeds" in kwargs and kwargs["inputs_embeds"] is not None:
+        # #region agent log - Hypothesis A: Using pre-computed inputs_embeds
+        with open("/workspace/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "qwen3_vl.py:qwen3_vl_base_forward:using_precomputed", "hypothesisId": "A", "message": "Using pre-computed inputs_embeds, skipping _get_input_embeds", "data": {"inputs_embeds_shape": str(kwargs["inputs_embeds"].shape)}, "timestamp": __import__("time").time()}) + "\n")
+        # #endregion
+        return self.language_model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+    
     input_kwargs = _get_input_embeds(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
@@ -444,6 +464,13 @@ def forward_with_normal_backend(
     temperature: float = 1.0,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputForPPO":
+    # #region agent log - Hypothesis B/C: Track what's being passed
+    import json as _json
+    _log_data = {"input_ids_is_none": input_ids is None, "inputs_embeds_in_kwargs": "inputs_embeds" in kwargs, "kwargs_keys": list(kwargs.keys())}
+    with open("/workspace/.cursor/debug.log", "a") as _f:
+        _f.write(_json.dumps({"location": "qwen3_vl.py:forward_with_normal_backend:entry", "hypothesisId": "B", "message": "forward_with_normal_backend entry", "data": _log_data, "timestamp": __import__("time").time()}) + "\n")
+    # #endregion
+
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
     logits = self.lm_head(hidden_states)

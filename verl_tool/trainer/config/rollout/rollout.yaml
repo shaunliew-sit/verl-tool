@@ -272,6 +272,10 @@ skip_dump_dir: /tmp/rollout_dump
 # When enabled (True), the rollout assume token in token out for generation
 skip_tokenizer_init: True
 
+# Disable LoRA in vLLM/sglang rollout. Useful for multimodal models (e.g., Qwen3-VL)
+# where vLLM LoRA support is limited. Training FSDP will still use LoRA.
+disable_rollout_lora: False
+
 # profile the rollout model in `generate_sequence` 
 profiler:
 

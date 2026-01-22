@@ -258,7 +258,10 @@ class vLLMHttpServerBase:
             )
 
         # update lora-related args
-        if self.model_config.lora_rank > 0:
+        # Check disable_rollout_lora to skip LoRA in vLLM (useful for multimodal models
+        # where vLLM LoRA support is limited)
+        disable_rollout_lora = getattr(self.config, "disable_rollout_lora", False)
+        if self.model_config.lora_rank > 0 and not disable_rollout_lora:
             args.update(
                 {
                     "enable_lora": True,
@@ -266,6 +269,9 @@ class vLLMHttpServerBase:
                     "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
                 }
             )
+        elif self.model_config.lora_rank > 0 and disable_rollout_lora:
+            logger.info("LoRA disabled for vLLM rollout (disable_rollout_lora=True). "
+                        "Training FSDP will still use LoRA.")
 
         server_args = ["serve", self.model_config.local_path]
         for k, v in args.items():

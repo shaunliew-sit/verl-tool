@@ -77,13 +77,20 @@ class HFModelConfig(BaseConfig):
     # lora related. We may setup a separate config later
     lora_rank: int = 0
     lora_alpha: int = 16
-    target_modules: Optional[str] = "all-linear"
+    # Can be string (e.g., "all-linear") or list of module names (e.g., ["q_proj", "k_proj"])
+    target_modules: Any = "all-linear"
 
     exclude_modules: Optional[str] = None
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
     use_liger: bool = False
+
+    # Spatial linking model configuration
+    use_spatial_linking: bool = False
+    freeze_spatial_linking: bool = False
+    freeze_vision_tower: bool = False
+    spatial_linking_checkpoint: Optional[str] = None
 
     use_fused_kernels: bool = False
     fused_kernel_options: dict = field(default_factory=dict)

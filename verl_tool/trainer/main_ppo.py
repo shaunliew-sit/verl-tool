@@ -60,6 +60,16 @@ def run_ppo(config) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
+        
+        # Add PYTHONPATH to runtime environment for spatial_linking_training module
+        # This ensures Ray workers can import the module
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        spatial_linking_path = os.environ.get("SPATIAL_LINKING_PATH", "/workspace/spatial_linking_training")
+        if spatial_linking_path and spatial_linking_path not in pythonpath:
+            pythonpath = f"{pythonpath}:{spatial_linking_path}" if pythonpath else spatial_linking_path
+        if pythonpath:
+            default_runtime_env["env_vars"]["PYTHONPATH"] = pythonpath
+        
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)

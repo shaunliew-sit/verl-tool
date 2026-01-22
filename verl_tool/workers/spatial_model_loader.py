@@ -35,13 +35,86 @@ from omegaconf import DictConfig
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoConfig
 
-# Add spatial_linking_training to path if not already present
-SPATIAL_LINKING_PATH = Path(__file__).parent.parent.parent.parent / "spatial_linking_training"
-if str(SPATIAL_LINKING_PATH) not in sys.path:
-    sys.path.insert(0, str(SPATIAL_LINKING_PATH))
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _ensure_spatial_linking_in_path():
+    """
+    Ensure spatial_linking_training is in sys.path.
+    This function tries multiple methods to find and add the module path,
+    which is necessary for Ray workers that may not inherit sys.path modifications.
+    
+    Note: For `from spatial_linking_training.models import X` to work,
+    the PARENT directory of spatial_linking_training must be in sys.path.
+    """
+    # Check if already importable
+    try:
+        import spatial_linking_training
+        return True
+    except ImportError:
+        pass
+    
+    # List of potential PARENT paths to try (the directory containing spatial_linking_training)
+    potential_parent_paths = []
+    
+    # 1. From environment variable (set by training script) - get parent
+    env_path = os.environ.get("SPATIAL_LINKING_PATH")
+    if env_path:
+        # If it points to the package, use its parent
+        if os.path.basename(env_path) == "spatial_linking_training":
+            potential_parent_paths.append(os.path.dirname(env_path))
+        else:
+            potential_parent_paths.append(env_path)
+    
+    # 2. From PYTHONPATH environment variable - get parent
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    for p in pythonpath.split(":"):
+        if p and "spatial_linking" in p:
+            if os.path.basename(p.rstrip("/")) == "spatial_linking_training":
+                potential_parent_paths.append(os.path.dirname(p.rstrip("/")))
+            else:
+                potential_parent_paths.append(p)
+    
+    # 3. Hardcoded common locations - use parent directories
+    potential_parent_paths.extend([
+        "/workspace",  # Parent of /workspace/spatial_linking_training
+        str(Path(__file__).parent.parent.parent.parent),  # Should be /workspace
+        str(Path.cwd().parent),
+        str(Path.cwd()),
+    ])
+    
+    # Try each parent path
+    for parent_path in potential_parent_paths:
+        if not parent_path:
+            continue
+        parent_path = str(parent_path)
+        
+        # Check if spatial_linking_training exists in this parent
+        pkg_path = os.path.join(parent_path, "spatial_linking_training")
+        if not os.path.isdir(pkg_path):
+            continue
+        
+        # Check if __init__.py exists (required for package import)
+        init_path = os.path.join(pkg_path, "__init__.py")
+        if not os.path.exists(init_path):
+            # Try to create it if the directory exists
+            logger.warning(f"Missing __init__.py in {pkg_path}, trying to proceed anyway")
+        
+        if parent_path not in sys.path:
+            sys.path.insert(0, parent_path)
+            # Verify it works
+            try:
+                import spatial_linking_training
+                logger.info(f"Successfully added parent path for spatial_linking_training: {parent_path}")
+                return True
+            except ImportError as e:
+                logger.warning(f"Failed to import after adding {parent_path}: {e}")
+                # Keep the path in case it helps with later imports
+    
+    # Log current state for debugging
+    logger.error(f"Failed to find spatial_linking_training. Current sys.path: {sys.path[:5]}...")
+    return False
 
 
 def load_spatial_linking_model(
@@ -72,13 +145,21 @@ def load_spatial_linking_model(
     Returns:
         SpatialLinkingInteractionModel instance
     """
+    # Ensure spatial_linking_training is in the path (critical for Ray workers)
+    _ensure_spatial_linking_in_path()
+    
     # Import spatial linking model
     try:
         from spatial_linking_training.models.spatial_model import SpatialLinkingInteractionModel
     except ImportError as e:
+        # Log debugging info
+        logger.error(f"sys.path: {sys.path}")
+        logger.error(f"PYTHONPATH: {os.environ.get('PYTHONPATH', 'not set')}")
+        logger.error(f"SPATIAL_LINKING_PATH: {os.environ.get('SPATIAL_LINKING_PATH', 'not set')}")
         raise ImportError(
             f"Failed to import SpatialLinkingInteractionModel. "
             f"Make sure spatial_linking_training is in the Python path. "
+            f"Tried paths: /workspace/spatial_linking_training and others. "
             f"Error: {e}"
         )
     
@@ -208,6 +289,7 @@ def get_spatial_linking_model_class():
     Returns:
         SpatialLinkingInteractionModel class
     """
+    _ensure_spatial_linking_in_path()
     try:
         from spatial_linking_training.models.spatial_model import SpatialLinkingInteractionModel
         return SpatialLinkingInteractionModel
