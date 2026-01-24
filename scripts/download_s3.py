@@ -3,7 +3,7 @@
 Download files from S3 bucket to local directory.
 
 Usage:
-    python scripts/download_s3.py --bucket hoi-dataset --prefix data/hoi_cof_sft/ --local-dir data/hoi_cof_sft/
+    python scripts/download_s3.py --bucket hoi-dataset --prefix data/ --local-dir /workspace/verl-tool/data/
     
     # Download entire bucket
     python scripts/download_s3.py --bucket my-bucket --local-dir data/

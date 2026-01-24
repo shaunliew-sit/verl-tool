@@ -21,6 +21,8 @@ dependencies = [
     "boto3>=1.42.19",
     "bert-score>=0.3.13",
     "pycocoevalcap>=1.2",
+    "nltk>=3.9.2",
+    "groundingdino-py>=0.4.0",
 ]
 
 [tool.setuptools]

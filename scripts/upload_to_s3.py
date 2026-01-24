@@ -3,6 +3,7 @@
 Upload training checkpoints to AWS S3.
 
 Usage:
+python scripts/download_s3.py --bucket hoi-dataset --prefix data/ --local-dir /workspace/verl-tool/data/
     python scripts/upload_to_s3.py --checkpoint-dir ./checkpoints/hoi_reward_v2/hoi_reward_v2-fsdp2-agent-qwen_qwen3-vl-4b-instruct-grpo-n8-b128-t1.0-lr5e-7-hoi-detection-v2 --bucket hoi-dataset --prefix checkpoints-new/
 
     #upload the hoi_cof_sft dataset
