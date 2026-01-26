@@ -124,6 +124,87 @@ def get_unique_output_dir(base_dir: str) -> str:
     return f"{base_dir}_{timestamp}"
 
 
+def load_previous_results(resume_dir: str) -> Tuple[List[Dict], List[Dict], set]:
+    """Load previous results for resuming evaluation.
+    
+    Args:
+        resume_dir: Path to previous output directory
+        
+    Returns:
+        Tuple of (previous_results, previous_thinking_logs, completed_file_names)
+    """
+    results_file = os.path.join(resume_dir, 'checkpoint_results.jsonl')
+    thinking_file = os.path.join(resume_dir, 'checkpoint_thinking.jsonl')
+    
+    previous_results = []
+    previous_thinking = []
+    completed_files = set()
+    
+    # Load checkpoint results (JSONL format for incremental saves)
+    if os.path.exists(results_file):
+        with open(results_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        r = json.loads(line)
+                        previous_results.append(r)
+                        if 'file_name' in r:
+                            completed_files.add(r['file_name'])
+                    except json.JSONDecodeError:
+                        continue
+        logger.info(f"Loaded {len(previous_results)} previous results from checkpoint")
+    
+    # Load thinking logs
+    if os.path.exists(thinking_file):
+        with open(thinking_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        previous_thinking.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    
+    return previous_results, previous_thinking, completed_files
+
+
+def save_checkpoint(output_dir: str, results: List[Dict], thinking_logs: List, 
+                    checkpoint_type: str = 'incremental'):
+    """Save checkpoint results incrementally.
+    
+    Args:
+        output_dir: Output directory
+        results: List of result dictionaries to save
+        thinking_logs: List of thinking log objects to save  
+        checkpoint_type: 'incremental' appends, 'full' overwrites
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    results_file = os.path.join(output_dir, 'checkpoint_results.jsonl')
+    thinking_file = os.path.join(output_dir, 'checkpoint_thinking.jsonl')
+    
+    mode = 'a' if checkpoint_type == 'incremental' else 'w'
+    
+    # Save results as JSONL (one per line for easy appending)
+    with open(results_file, mode) as f:
+        for r in results:
+            # Make JSON serializable
+            r_copy = r.copy()
+            if 'gt_pairs' in r_copy:
+                r_copy['gt_pairs'] = [[list(p), list(o)] for p, o in r_copy['gt_pairs']]
+            if 'pred_pairs' in r_copy:
+                r_copy['pred_pairs'] = [[list(p), list(o)] for p, o in r_copy['pred_pairs']]
+            f.write(json.dumps(r_copy) + '\n')
+    
+    # Save thinking logs
+    if thinking_logs:
+        with open(thinking_file, mode) as f:
+            for log in thinking_logs:
+                if hasattr(log, '__dict__'):
+                    f.write(json.dumps(asdict(log)) + '\n')
+                elif isinstance(log, dict):
+                    f.write(json.dumps(log) + '\n')
+
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -337,6 +418,30 @@ Guidelines: Analyze the image to locate human-object interaction pairs. You may 
 Think in the mind first, and then decide whether to call tools if needed OR provide final answer. Format strictly as: <think>...</think> <tool_call>...</tool_call> (if any tools needed) OR <answer>...</answer> (if no tools needed)."""
 
 
+def build_grounding_prompt_single_turn(action: str, object_category: str) -> str:
+    """Build single-turn grounding prompt (no tool calling, direct answer).
+    
+    This prompt is designed for faster evaluation by requesting immediate
+    bounding box output without tool-calling capability.
+    """
+    return f"""Human-Object Interaction Detection: Find all instances of "{action} {object_category}" in this image.
+
+For each interaction, output bounding boxes for:
+1. The PERSON performing the action  
+2. The {object_category.upper()} involved
+
+Output format (JSON list):
+[
+    {{"bbox_2d": [x1, y1, x2, y2], "label": "person"}},
+    {{"bbox_2d": [x1, y1, x2, y2], "label": "{object_category}"}}
+]
+
+Coordinates must be in 1000x1000 normalized format. Output ONLY the JSON list, nothing else."""
+
+
+SINGLE_TURN_SYSTEM_PROMPT = """You are an expert at Human-Object Interaction detection. Given an image and action-object query, output bounding boxes for person-object pairs performing the specified interaction. Be precise and output coordinates in 1000x1000 normalized format."""
+
+
 def build_referring_prompt(person_box: List[int], object_box: List[int], 
                           object_category: str, width: int, height: int) -> str:
     """Build referring task prompt with normalized coordinates."""
@@ -383,22 +488,51 @@ class HOIAgentEvaluator:
         self.save_thinking = save_thinking
         self.hoi_tool = None
         
+        # Image encoding cache to avoid re-encoding same images
+        self._image_cache = {}
+        self._cache_max_size = 100  # Keep last 100 encoded images
+        
         try:
             from verl_tool.servers.tools.hoi_detector import HOIDetectorTool
             self.hoi_tool = HOIDetectorTool()
         except Exception:
             pass  # Tool not needed if just testing model responses
     
-    def _encode_image(self, image: Image.Image) -> str:
-        """Encode PIL image to base64 string."""
+    def _encode_image(self, image: Image.Image, cache_key: str = None) -> str:
+        """Encode PIL image to base64 string with caching.
+        
+        Args:
+            image: PIL Image to encode
+            cache_key: Optional cache key (e.g., image path). If same size as cached,
+                      returns cached encoding.
+        """
+        # Check cache first if we have a key
+        if cache_key and cache_key in self._image_cache:
+            cached_size, cached_b64 = self._image_cache[cache_key]
+            if cached_size == image.size:
+                return cached_b64
+        
+        # Encode the image
         buffered = BytesIO()
         max_size = 1024
+        img_to_encode = image
         if max(image.size) > max_size:
             ratio = max_size / max(image.size)
             new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
-        image.save(buffered, format="JPEG", quality=85)
-        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+            img_to_encode = image.resize(new_size, Image.Resampling.LANCZOS)
+        img_to_encode.save(buffered, format="JPEG", quality=85)
+        encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        
+        # Cache the result
+        if cache_key:
+            # Limit cache size
+            if len(self._image_cache) >= self._cache_max_size:
+                # Remove oldest entry (first key)
+                oldest = next(iter(self._image_cache))
+                del self._image_cache[oldest]
+            self._image_cache[cache_key] = (image.size, encoded)
+        
+        return encoded
     
     def _run_grounding_dino(self, image: Image.Image, query: str, box_threshold: float = 0.3, text_threshold: float = 0.25) -> List[Dict]:
         """Run Grounding DINO object detection on image.
@@ -503,8 +637,17 @@ class HOIAgentEvaluator:
             raise RuntimeError(f"Detection error: {e}")
     
     async def call_model(self, messages: List[Dict], images: List[Image.Image] = None,
-                         session: aiohttp.ClientSession = None) -> Dict:
-        """Call the vLLM server with messages and optional images."""
+                         session: aiohttp.ClientSession = None, 
+                         image_cache_key: str = None) -> Dict:
+        """Call the vLLM server with messages and optional images.
+        
+        Args:
+            messages: List of conversation messages
+            images: Optional list of PIL Images
+            session: aiohttp session
+            image_cache_key: Cache key for image encoding (e.g., image path).
+                           Only effective if image hasn't been zoomed.
+        """
         formatted_messages = []
         images_added = False
         
@@ -515,8 +658,10 @@ class HOIAgentEvaluator:
                 content = msg['content']
                 if images and not images_added and not isinstance(content, list):
                     content_parts = []
-                    for img in images:
-                        img_base64 = self._encode_image(img)
+                    for i, img in enumerate(images):
+                        # Use cache key for first image if provided and not zoomed
+                        key = f"{image_cache_key}_{i}" if image_cache_key else None
+                        img_base64 = self._encode_image(img, cache_key=key)
                         content_parts.append({
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
@@ -666,10 +811,16 @@ class HOIAgentEvaluator:
         
         final_response = ""
         turn = 0
+        image_is_original = True  # Track if image has been zoomed
         
         for turn in range(self.max_turns):
             try:
-                response = await self.call_model(state.messages, [state.current_image], session)
+                # Use cache key only if image hasn't been modified (zoomed)
+                cache_key = image_path if image_is_original else None
+                response = await self.call_model(
+                    state.messages, [state.current_image], session,
+                    image_cache_key=cache_key
+                )
             except Exception as e:
                 if self.verbose:
                     logger.error(f"Error calling model: {e}")
@@ -719,6 +870,10 @@ class HOIAgentEvaluator:
                         arguments = json.loads(func.get('arguments', '{}'))
                     except:
                         arguments = {}
+                    
+                    # Mark image as modified if zoom is used
+                    if tool_name in ('zoom_in', 'zoom_out'):
+                        image_is_original = False
                     
                     result = self.execute_tool(tool_name, arguments, state)
                     state.tool_calls.append({
@@ -1320,12 +1475,20 @@ async def evaluate_grounding_batch(
     save_thinking: bool = True,
     save_visualizations: bool = False,
     output_dir: str = None,
-    verbose: bool = False
+    verbose: bool = False,
+    checkpoint_interval: int = 100,
+    completed_files: set = None
 ) -> Tuple[List[Dict], List[ThinkingLog]]:
-    """Evaluate grounding task on a batch of samples."""
+    """Evaluate grounding task on a batch of samples with incremental checkpointing."""
     results = []
     thinking_logs = []
     semaphore = asyncio.Semaphore(concurrency)
+    completed_files = completed_files or set()
+    
+    # Track checkpoint progress
+    checkpoint_results = []
+    checkpoint_thinking = []
+    processed_count = [0]  # Use list for mutable in closure
     
     # Create visualization directory if needed
     viz_dir = None
@@ -1455,15 +1618,37 @@ async def evaluate_grounding_batch(
             
             return result_entry, thinking_log
     
+    # Filter out already completed samples
+    samples_to_process = [(i, s) for i, s in enumerate(samples) if s.file_name not in completed_files]
+    
+    if len(samples_to_process) < len(samples):
+        logger.info(f"Resuming: {len(samples) - len(samples_to_process)} already completed, {len(samples_to_process)} remaining")
+    
     async with aiohttp.ClientSession() as session:
-        tasks = [process_one(i, s, session) for i, s in enumerate(samples)]
+        tasks = [process_one(i, s, session) for i, s in samples_to_process]
         
         for coro in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Grounding"):
             result, log = await coro
             if result is not None:
                 results.append(result)
+                checkpoint_results.append(result)
             if log is not None:
                 thinking_logs.append(log)
+                checkpoint_thinking.append(log)
+            
+            processed_count[0] += 1
+            
+            # Save checkpoint every N samples
+            if output_dir and checkpoint_interval > 0 and processed_count[0] % checkpoint_interval == 0:
+                save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+                logger.info(f"Checkpoint saved: {processed_count[0]} samples processed")
+                checkpoint_results.clear()
+                checkpoint_thinking.clear()
+    
+    # Save any remaining results
+    if output_dir and checkpoint_results:
+        save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+        logger.info(f"Final checkpoint saved: {processed_count[0]} total samples")
     
     return results, thinking_logs
 
@@ -1476,12 +1661,20 @@ async def evaluate_referring_batch(
     save_thinking: bool = True,
     save_visualizations: bool = False,
     output_dir: str = None,
-    verbose: bool = False
+    verbose: bool = False,
+    checkpoint_interval: int = 100,
+    completed_files: set = None
 ) -> Tuple[List[Dict], List[ThinkingLog]]:
-    """Evaluate referring task on a batch of samples."""
+    """Evaluate referring task on a batch of samples with incremental checkpointing."""
     results = []
     thinking_logs = []
     semaphore = asyncio.Semaphore(concurrency)
+    completed_files = completed_files or set()
+    
+    # Track checkpoint progress
+    checkpoint_results = []
+    checkpoint_thinking = []
+    processed_count = [0]
     
     # Create visualization directory if needed
     viz_dir = None
@@ -1573,15 +1766,265 @@ async def evaluate_referring_batch(
             
             return result_entry, thinking_log
     
+    # Filter out already completed samples
+    samples_to_process = [(i, s) for i, s in enumerate(samples) if s.file_name not in completed_files]
+    
+    if len(samples_to_process) < len(samples):
+        logger.info(f"Resuming: {len(samples) - len(samples_to_process)} already completed, {len(samples_to_process)} remaining")
+    
     async with aiohttp.ClientSession() as session:
-        tasks = [process_one(i, s, session) for i, s in enumerate(samples)]
+        tasks = [process_one(i, s, session) for i, s in samples_to_process]
         
         for coro in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Referring"):
             result, log = await coro
             if result is not None:
                 results.append(result)
+                checkpoint_results.append(result)
             if log is not None:
                 thinking_logs.append(log)
+                checkpoint_thinking.append(log)
+            
+            processed_count[0] += 1
+            
+            # Save checkpoint every N samples
+            if output_dir and checkpoint_interval > 0 and processed_count[0] % checkpoint_interval == 0:
+                save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+                logger.info(f"Checkpoint saved: {processed_count[0]} samples processed")
+                checkpoint_results.clear()
+                checkpoint_thinking.clear()
+    
+    # Save any remaining results
+    if output_dir and checkpoint_results:
+        save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+        logger.info(f"Final checkpoint saved: {processed_count[0]} total samples")
+    
+    return results, thinking_logs
+
+
+async def evaluate_grounding_single_turn_batch(
+    endpoint: str,
+    model_name: str,
+    samples: List[GroundingSample],
+    img_prefix: str,
+    concurrency: int = 16,
+    output_dir: str = None,
+    checkpoint_interval: int = 100,
+    completed_files: set = None,
+    verbose: bool = False
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Evaluate grounding task using single-turn mode (no tool calling).
+    
+    This is much faster than the agent loop as it makes a single vLLM call per sample.
+    The model directly outputs bounding boxes without iterative tool calling.
+    
+    Args:
+        endpoint: vLLM server endpoint
+        model_name: Model name
+        samples: List of grounding samples
+        img_prefix: Image directory prefix
+        concurrency: Number of concurrent requests
+        output_dir: Directory for checkpoints
+        checkpoint_interval: Save checkpoint every N samples
+        completed_files: Set of already completed file names (for resume)
+        verbose: Verbose logging
+    
+    Returns:
+        Tuple of (results_list, thinking_logs_list)
+    """
+    results = []
+    thinking_logs = []
+    semaphore = asyncio.Semaphore(concurrency)
+    completed_files = completed_files or set()
+    
+    # Checkpoint tracking
+    checkpoint_results = []
+    checkpoint_thinking = []
+    processed_count = [0]
+    
+    async def encode_image(image: Image.Image) -> str:
+        """Encode PIL image to base64."""
+        buffered = BytesIO()
+        max_size = 1024
+        if max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        image.save(buffered, format="JPEG", quality=85)
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    
+    async def process_one(idx: int, sample: GroundingSample, session: aiohttp.ClientSession):
+        async with semaphore:
+            image_path = os.path.join(img_prefix, sample.file_name)
+            
+            if not os.path.exists(image_path):
+                return None, None
+            
+            # Build ground truth pairs
+            gt_pairs = []
+            for i in range(sample.num_pairs):
+                person_idx = sample.gt_box_inds[i * 2]
+                object_idx = sample.gt_box_inds[i * 2 + 1]
+                gt_pairs.append((sample.boxes[person_idx], sample.boxes[object_idx]))
+            
+            # Load and encode image
+            try:
+                image = Image.open(image_path).convert('RGB')
+                img_width, img_height = image.size
+                img_b64 = await encode_image(image)
+                image.close()
+            except Exception as e:
+                if verbose:
+                    logger.error(f"Error loading image {image_path}: {e}")
+                return None, None
+            
+            # Build single-turn prompt
+            prompt = build_grounding_prompt_single_turn(sample.action, sample.object_category)
+            
+            # Build request payload
+            messages = [
+                {"role": "system", "content": SINGLE_TURN_SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text", "text": prompt}
+                ]}
+            ]
+            
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "max_tokens": 1024,
+                "temperature": 0.1,  # Lower temperature for more deterministic outputs
+            }
+            
+            # Make API call with retries
+            max_retries = 5
+            response_text = ""
+            
+            for attempt in range(max_retries):
+                try:
+                    async with session.post(
+                        f"{endpoint.rstrip('/')}/chat/completions",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            raise Exception(f"API error {response.status}: {error_text[:200]}")
+                        
+                        result = await response.json()
+                        response_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        break
+                        
+                except (aiohttp.ServerDisconnectedError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt < max_retries - 1:
+                        if verbose:
+                            logger.warning(f"Retry {attempt + 1}/{max_retries} for {sample.file_name}: {e}")
+                        await asyncio.sleep(1 * (attempt + 1))
+                    else:
+                        if verbose:
+                            logger.error(f"Failed after {max_retries} retries: {sample.file_name}")
+                        return None, None
+            
+            # Extract predictions
+            pred_boxes = extract_boxes_from_response(response_text)
+            
+            # Convert from 1000x1000 to pixel coordinates
+            converted_boxes = []
+            for box in pred_boxes:
+                if "bbox_2d" in box and len(box["bbox_2d"]) == 4:
+                    x1, y1, x2, y2 = box["bbox_2d"]
+                    converted_boxes.append({
+                        "bbox_2d": [
+                            int(x1 * img_width / 1000),
+                            int(y1 * img_height / 1000),
+                            int(x2 * img_width / 1000),
+                            int(y2 * img_height / 1000)
+                        ],
+                        "label": box.get("label", "object")
+                    })
+                else:
+                    converted_boxes.append(box)
+            
+            pred_pairs = extract_pairs_from_boxes(converted_boxes)
+            
+            # Compute metrics
+            sample_metrics = {}
+            for threshold in [0.5, 0.75]:
+                matched = match_pairs_greedy(pred_pairs, gt_pairs, threshold)
+                recall = matched / len(gt_pairs) if gt_pairs else 0
+                sample_metrics[f"recall@{threshold}"] = recall
+            
+            result_entry = {
+                "sample_id": idx,
+                "file_name": sample.file_name,
+                "action": sample.action,
+                "object_category": sample.object_category,
+                "gt_pairs": gt_pairs,
+                "pred_pairs": pred_pairs,
+                "pred_boxes": converted_boxes,
+                "num_gt_pairs": len(gt_pairs),
+                "num_pred_pairs": len(pred_pairs),
+                "response": response_text,
+                "num_turns": 1,
+                "num_tool_calls": 0,
+                "tools_used": [],
+                "metrics": sample_metrics
+            }
+            
+            thinking_log = {
+                "sample_id": idx,
+                "file_name": sample.file_name,
+                "task_type": "grounding",
+                "ground_truth": {
+                    "action": sample.action,
+                    "object": sample.object_category,
+                    "pairs": [[list(p), list(o)] for p, o in gt_pairs]
+                },
+                "conversation": messages,
+                "thinking_blocks": [],
+                "tool_calls": [],
+                "num_turns": 1,
+                "num_tool_calls": 0,
+                "tools_used": [],
+                "prediction": response_text,
+                "metrics": sample_metrics
+            }
+            
+            return result_entry, thinking_log
+    
+    # Filter samples for resume
+    samples_to_process = [(i, s) for i, s in enumerate(samples) if s.file_name not in completed_files]
+    
+    if len(samples_to_process) < len(samples):
+        logger.info(f"Resuming: {len(samples) - len(samples_to_process)} completed, {len(samples_to_process)} remaining")
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = [process_one(i, s, session) for i, s in samples_to_process]
+        
+        for coro in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Grounding (single-turn)"):
+            result, log = await coro
+            if result is not None:
+                results.append(result)
+                checkpoint_results.append(result)
+            if log is not None:
+                thinking_logs.append(log)
+                checkpoint_thinking.append(log)
+            
+            processed_count[0] += 1
+            
+            # Save checkpoint
+            if output_dir and checkpoint_interval > 0 and processed_count[0] % checkpoint_interval == 0:
+                save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, "incremental")
+                logger.info(f"Checkpoint saved: {processed_count[0]} samples")
+                checkpoint_results.clear()
+                checkpoint_thinking.clear()
+    
+    # Save remaining
+    if output_dir and checkpoint_results:
+        save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, "incremental")
+        logger.info(f"Final checkpoint: {processed_count[0]} total samples")
     
     return results, thinking_logs
 
@@ -1639,14 +2082,16 @@ def compute_tool_usage_stats(thinking_logs: List[ThinkingLog]) -> Dict:
 
 async def run_grounding_evaluation(args):
     """Run grounding evaluation."""
+    mode_str = "Single-Turn" if getattr(args, 'single_turn', False) else "Multi-Turn (Agent)"
     logger.info("=" * 60)
-    logger.info("HOI Grounding Evaluation")
+    logger.info(f"HOI Grounding Evaluation - {mode_str}")
     logger.info("=" * 60)
     logger.info(f"Annotation file: {args.ann_file}")
     logger.info(f"Image prefix: {args.img_prefix}")
     logger.info(f"Endpoint: {args.endpoint}")
     logger.info(f"Model: {args.model}")
     logger.info(f"Concurrency: {args.concurrency}")
+    logger.info(f"Mode: {mode_str}")
     logger.info("=" * 60)
     
     # Load annotations
@@ -1656,27 +2101,75 @@ async def run_grounding_evaluation(args):
     
     logger.info(f"Loaded {len(samples)} samples")
     
-    # Create evaluator
-    evaluator = HOIAgentEvaluator(
-        endpoint=args.endpoint,
-        model_name=args.model,
-        max_turns=args.max_turns,
-        verbose=args.verbose,
-        save_thinking=args.save_thinking
-    )
-    
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Run evaluation
-    results, thinking_logs = await evaluate_grounding_batch(
-        evaluator, samples, args.img_prefix,
-        concurrency=args.concurrency,
-        save_thinking=args.save_thinking,
-        save_visualizations=args.save_viz,
-        output_dir=args.output_dir,
-        verbose=args.verbose
-    )
+    # Choose evaluation mode
+    if getattr(args, 'single_turn', False):
+        # Single-turn mode: fast, direct inference
+        logger.info("Using SINGLE-TURN mode (faster, no tool calling)")
+        results, thinking_logs = await evaluate_grounding_single_turn_batch(
+            endpoint=args.endpoint,
+            model_name=args.model,
+            samples=samples,
+            img_prefix=args.img_prefix,
+            concurrency=args.concurrency,
+            output_dir=args.output_dir,
+            checkpoint_interval=args.checkpoint_interval,
+            completed_files=getattr(args, 'completed_files', set()),
+            verbose=args.verbose
+        )
+        # Convert thinking_logs dicts to appropriate format for stats
+        thinking_logs_for_stats = []
+        for log in thinking_logs:
+            if isinstance(log, dict):
+                thinking_logs_for_stats.append(ThinkingLog(
+                    sample_id=log.get('sample_id', 0),
+                    file_name=log.get('file_name', ''),
+                    task_type=log.get('task_type', 'grounding'),
+                    ground_truth=log.get('ground_truth', {}),
+                    conversation=log.get('conversation', []),
+                    thinking_blocks=log.get('thinking_blocks', []),
+                    tool_calls=log.get('tool_calls', []),
+                    num_turns=log.get('num_turns', 1),
+                    num_tool_calls=log.get('num_tool_calls', 0),
+                    tools_used=log.get('tools_used', []),
+                    prediction=log.get('prediction', ''),
+                    metrics=log.get('metrics', {})
+                ))
+            else:
+                thinking_logs_for_stats.append(log)
+        thinking_logs = thinking_logs_for_stats
+    else:
+        # Multi-turn agent mode: with tool calling
+        logger.info("Using MULTI-TURN mode (agent loop with tool calling)")
+        # Create evaluator
+        evaluator = HOIAgentEvaluator(
+            endpoint=args.endpoint,
+            model_name=args.model,
+            max_turns=args.max_turns,
+            verbose=args.verbose,
+            save_thinking=args.save_thinking
+        )
+        
+        # Run evaluation with checkpointing
+        results, thinking_logs = await evaluate_grounding_batch(
+            evaluator, samples, args.img_prefix,
+            concurrency=args.concurrency,
+            save_thinking=args.save_thinking,
+            save_visualizations=args.save_viz,
+            output_dir=args.output_dir,
+            verbose=args.verbose,
+            checkpoint_interval=args.checkpoint_interval,
+            completed_files=getattr(args, 'completed_files', set())
+        )
+    
+    # Merge with previous results if resuming
+    previous_results = getattr(args, 'previous_results', [])
+    if previous_results:
+        logger.info(f"Merging {len(results)} new results with {len(previous_results)} previous results")
+        results = previous_results + results
+        thinking_logs = getattr(args, 'previous_thinking', []) + thinking_logs
     
     # Compute metrics
     metrics = compute_grounding_metrics(results)
@@ -1771,15 +2264,24 @@ async def run_referring_evaluation(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Run evaluation
+    # Run evaluation with checkpointing
     results, thinking_logs = await evaluate_referring_batch(
         evaluator, samples, args.img_prefix,
         concurrency=args.concurrency,
         save_thinking=args.save_thinking,
         save_visualizations=args.save_viz,
         output_dir=args.output_dir,
-        verbose=args.verbose
+        verbose=args.verbose,
+        checkpoint_interval=args.checkpoint_interval,
+        completed_files=getattr(args, 'completed_files', set())
     )
+    
+    # Merge with previous results if resuming
+    previous_results = getattr(args, 'previous_results', [])
+    if previous_results:
+        logger.info(f"Merging {len(results)} new results with {len(previous_results)} previous results")
+        results = previous_results + results
+        thinking_logs = getattr(args, 'previous_thinking', []) + thinking_logs
     
     # Compute metrics
     metrics = compute_referring_metrics(results, bertscore_gpu=args.bertscore_gpu)
@@ -1881,8 +2383,14 @@ def main():
                         help="vLLM server endpoint")
     parser.add_argument("--model", type=str, required=True,
                         help="Model name served by vLLM")
-    parser.add_argument("--max-turns", type=int, default=10,
-                        help="Maximum agent turns (default: 10)")
+    parser.add_argument("--max-turns", type=int, default=5,
+                        help="Maximum agent turns (default: 5)")
+    parser.add_argument("--single-turn", action="store_true",
+                        help="Use single-turn mode (no tool calling, faster)")
+    parser.add_argument("--checkpoint-interval", type=int, default=100,
+                        help="Save checkpoint every N samples (default: 100)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to previous output directory to resume from")
     
     # Parallelization
     parser.add_argument("--num-workers", type=int, default=1,
@@ -1914,9 +2422,27 @@ def main():
     
     args = parser.parse_args()
     
-    # Apply unique output directory if enabled
-    if args.unique_run:
+    # Handle resume mode
+    previous_results = []
+    previous_thinking = []
+    completed_files = set()
+    
+    if args.resume:
+        if not os.path.exists(args.resume):
+            print(f"Error: Resume directory not found: {args.resume}")
+            sys.exit(1)
+        # Use the resume directory as output directory
+        args.output_dir = args.resume
+        args.unique_run = False  # Don't generate new directory
+        previous_results, previous_thinking, completed_files = load_previous_results(args.resume)
+    elif args.unique_run:
+        # Apply unique output directory if enabled and not resuming
         args.output_dir = get_unique_output_dir(args.output_dir)
+    
+    # Store for passing to evaluation functions
+    args.previous_results = previous_results
+    args.previous_thinking = previous_thinking
+    args.completed_files = completed_files
     
     # Setup logging BEFORE any other operations
     log_path = setup_logging(args.output_dir)

@@ -109,33 +109,99 @@ def get_unique_output_dir(base_dir: str) -> str:
     return f"{base_dir}_{timestamp}"
 
 
-def load_previous_results(resume_dir: str) -> Tuple[List[Dict], set]:
+def load_previous_results(resume_dir: str) -> Tuple[List[Dict], List[Dict], set]:
     """Load previous results for resuming evaluation.
     
     Args:
         resume_dir: Path to previous output directory
         
     Returns:
-        Tuple of (previous_results, completed_file_names)
+        Tuple of (previous_results, previous_thinking_logs, completed_file_names)
     """
+    # Try checkpoint file first (JSONL format for incremental saves)
+    checkpoint_file = os.path.join(resume_dir, 'checkpoint_results.jsonl')
     results_file = os.path.join(resume_dir, 'per_sample_results.json')
+    thinking_file = os.path.join(resume_dir, 'checkpoint_thinking.jsonl')
     
-    if not os.path.exists(results_file):
-        logger.warning(f"No previous results found at {results_file}")
-        return [], set()
-    
-    with open(results_file, 'r') as f:
-        previous_results = json.load(f)
-    
+    previous_results = []
+    previous_thinking = []
     completed_files = set()
-    for r in previous_results:
-        if 'file_name' in r:
-            completed_files.add(r['file_name'])
     
-    logger.info(f"Loaded {len(previous_results)} previous results from {resume_dir}")
+    # Try JSONL checkpoint first
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        r = json.loads(line)
+                        previous_results.append(r)
+                        if 'file_name' in r:
+                            completed_files.add(r['file_name'])
+                    except json.JSONDecodeError:
+                        continue
+        logger.info(f"Loaded {len(previous_results)} previous results from checkpoint")
+    # Fall back to JSON file
+    elif os.path.exists(results_file):
+        with open(results_file, 'r') as f:
+            previous_results = json.load(f)
+        for r in previous_results:
+            if 'file_name' in r:
+                completed_files.add(r['file_name'])
+        logger.info(f"Loaded {len(previous_results)} previous results from {resume_dir}")
+    else:
+        logger.warning(f"No previous results found at {resume_dir}")
+        return [], [], set()
+    
+    # Load thinking logs
+    if os.path.exists(thinking_file):
+        with open(thinking_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        previous_thinking.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    
     logger.info(f"Completed files: {len(completed_files)}")
+    return previous_results, previous_thinking, completed_files
+
+
+def save_checkpoint(output_dir: str, results: List[Dict], thinking_logs: List, 
+                    checkpoint_type: str = 'incremental'):
+    """Save checkpoint results incrementally.
     
-    return previous_results, completed_files
+    Args:
+        output_dir: Output directory
+        results: List of result dictionaries to save
+        thinking_logs: List of thinking log objects to save  
+        checkpoint_type: 'incremental' appends, 'full' overwrites
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    results_file = os.path.join(output_dir, 'checkpoint_results.jsonl')
+    thinking_file = os.path.join(output_dir, 'checkpoint_thinking.jsonl')
+    
+    mode = 'a' if checkpoint_type == 'incremental' else 'w'
+    
+    # Save results as JSONL (one per line for easy appending)
+    with open(results_file, mode) as f:
+        for r in results:
+            # Make JSON serializable
+            r_copy = r.copy()
+            if 'gt_pairs' in r_copy:
+                r_copy['gt_pairs'] = [[list(p), list(o)] for p, o in r_copy['gt_pairs']]
+            if 'pred_pairs' in r_copy:
+                r_copy['pred_pairs'] = [[list(p), list(o)] for p, o in r_copy['pred_pairs']]
+            f.write(json.dumps(r_copy) + '\n')
+    
+    # Save thinking logs
+    if thinking_logs:
+        with open(thinking_file, mode) as f:
+            for log in thinking_logs:
+                if hasattr(log, '__dict__'):
+                    f.write(json.dumps(asdict(log)) + '\n')
+                elif isinstance(log, dict):
+                    f.write(json.dumps(log) + '\n')
 
 
 # =============================================================================
@@ -687,6 +753,85 @@ class SpatialHOIAgentEvaluator:
         
         return response.strip()
     
+    def generate_batch_responses(
+        self, 
+        batch_data: List[Dict]
+    ) -> List[str]:
+        """Generate responses for a batch of samples in a single forward pass.
+        
+        This is a SINGLE-TURN inference only (no tool calling).
+        Much faster than running agent loop for each sample.
+        
+        Args:
+            batch_data: List of dicts with keys:
+                - 'image': PIL Image
+                - 'prompt': str prompt
+                - 'refer_boxes': Optional[torch.Tensor] of shape [N, 4]
+                
+        Returns:
+            List of response strings
+        """
+        if not batch_data:
+            return []
+        
+        device = next(self.model.parameters()).device
+        batch_size = len(batch_data)
+        
+        # Prepare all texts
+        all_texts = []
+        all_images = []
+        all_refer_boxes = []
+        
+        for item in batch_data:
+            # Build chat text for single-turn
+            chat_text = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+            chat_text += f"<|im_start|>user\n{item['prompt']}<|im_end|>\n"
+            chat_text += "<|im_start|>assistant\n"
+            all_texts.append(chat_text)
+            all_images.append(item['image'])
+            if 'refer_boxes' in item and item['refer_boxes'] is not None:
+                all_refer_boxes.append(item['refer_boxes'].to(device))
+            else:
+                all_refer_boxes.append(None)
+        
+        # Process batch - Qwen VL requires processing one at a time due to image handling
+        # but we can still batch the generation
+        all_responses = []
+        
+        # For now, process each sample but generate in sequence (still faster than agent loop)
+        # True batch processing of VLMs is complex due to variable image sizes
+        for i in range(batch_size):
+            inputs = self.processor(
+                text=all_texts[i],
+                images=[all_images[i]],
+                return_tensors="pt",
+                padding=True,
+            )
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            
+            generate_kwargs = {
+                **inputs,
+                "max_new_tokens": self.max_new_tokens,
+                "do_sample": True,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "pad_token_id": self.processor.tokenizer.pad_token_id,
+                "eos_token_id": self.processor.tokenizer.eos_token_id,
+            }
+            
+            if all_refer_boxes[i] is not None:
+                generate_kwargs["refer_boxes"] = [all_refer_boxes[i]]
+            
+            with torch.no_grad():
+                outputs = self.model.generate(**generate_kwargs)
+            
+            input_len = inputs['input_ids'].shape[1]
+            generated = outputs[0][input_len:]
+            response = self.processor.tokenizer.decode(generated, skip_special_tokens=True)
+            all_responses.append(response.strip())
+        
+        return all_responses
+    
     def run_agent_loop(self, image_path: str, prompt: str, 
                        refer_boxes: Optional[torch.Tensor] = None) -> Dict:
         """Run the agent loop for a single sample.
@@ -928,13 +1073,27 @@ def evaluate_grounding_batch(
     samples: List[GroundingSample],
     img_prefix: str,
     save_thinking: bool = True,
-    verbose: bool = False
+    verbose: bool = False,
+    checkpoint_interval: int = 100,
+    output_dir: str = None,
+    completed_files: set = None
 ) -> Tuple[List[Dict], List[ThinkingLog]]:
-    """Evaluate grounding task on a batch of samples."""
+    """Evaluate grounding task on a batch of samples with incremental checkpointing."""
     results = []
     thinking_logs = []
+    completed_files = completed_files or set()
     
-    for idx, sample in enumerate(tqdm(samples, desc="Grounding")):
+    # Track checkpoint progress
+    checkpoint_results = []
+    checkpoint_thinking = []
+    processed_count = 0
+    
+    # Filter out already completed samples
+    samples_to_process = [(idx, s) for idx, s in enumerate(samples) if s.file_name not in completed_files]
+    if len(samples_to_process) < len(samples):
+        logger.info(f"Resuming: {len(samples) - len(samples_to_process)} already completed, {len(samples_to_process)} remaining")
+    
+    for idx, sample in tqdm(samples_to_process, desc="Grounding"):
         image_path = os.path.join(img_prefix, sample.file_name)
         
         if not os.path.exists(image_path):
@@ -1034,9 +1193,25 @@ def evaluate_grounding_batch(
                 metrics=sample_metrics
             )
             thinking_logs.append(thinking_log)
+            checkpoint_thinking.append(thinking_log)
+        
+        checkpoint_results.append(result_entry)
+        processed_count += 1
+        
+        # Save checkpoint every N samples
+        if output_dir and checkpoint_interval > 0 and processed_count % checkpoint_interval == 0:
+            save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+            logger.info(f"Checkpoint saved: {processed_count} samples processed")
+            checkpoint_results.clear()
+            checkpoint_thinking.clear()
         
         if verbose:
             logger.info(f"Sample {idx}: recall@0.5={sample_metrics.get('recall@0.5', 0):.2f}")
+    
+    # Save any remaining results
+    if output_dir and checkpoint_results:
+        save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+        logger.info(f"Final checkpoint saved: {processed_count} total samples")
     
     return results, thinking_logs
 
@@ -1061,18 +1236,144 @@ def compute_interaction_box(person_box: List[int], object_box: List[int]) -> Lis
     ]
 
 
+def evaluate_referring_single_turn(
+    evaluator: SpatialHOIAgentEvaluator,
+    samples: List[ReferringSample],
+    img_prefix: str,
+    verbose: bool = False,
+    checkpoint_interval: int = 100,
+    output_dir: str = None,
+    completed_files: set = None
+) -> Tuple[List[Dict], List[ThinkingLog]]:
+    """Evaluate referring task with SINGLE-TURN inference (no tool calling).
+    
+    This is much faster than the agent loop as it skips tool calling.
+    Use this when you just need the model's direct answer.
+    """
+    results = []
+    thinking_logs = []
+    completed_files = completed_files or set()
+    
+    # Track checkpoint progress  
+    checkpoint_results = []
+    processed_count = 0
+    
+    # Filter out already completed samples
+    samples_to_process = [(idx, s) for idx, s in enumerate(samples) if s.file_name not in completed_files]
+    if len(samples_to_process) < len(samples):
+        logger.info(f"Resuming: {len(samples) - len(samples_to_process)} already completed, {len(samples_to_process)} remaining")
+    
+    for idx, sample in tqdm(samples_to_process, desc="Referring (single-turn)"):
+        image_path = os.path.join(img_prefix, sample.file_name)
+        
+        if not os.path.exists(image_path):
+            if verbose:
+                logger.warning(f"Image not found: {image_path}")
+            continue
+        
+        image = Image.open(image_path).convert('RGB')
+        
+        person_box = sample.boxes[sample.person_box_idx]
+        object_box = sample.boxes[sample.object_box_idx]
+        
+        # Normalize boxes to 1000x1000 format for spatial linking
+        person_box_norm = normalize_box_to_1000(person_box, sample.width, sample.height)
+        object_box_norm = normalize_box_to_1000(object_box, sample.width, sample.height)
+        interaction_box = compute_interaction_box(person_box_norm, object_box_norm)
+        
+        # Create refer_boxes tensor for spatial linking [3, 4]
+        refer_boxes_tensor = torch.tensor(
+            [person_box_norm, object_box_norm, interaction_box],
+            dtype=torch.float32
+        )
+        
+        words = sample.gt_action.split()
+        object_category = words[-1] if words else "object"
+        
+        prompt = build_referring_prompt(
+            person_box, object_box, object_category,
+            sample.width, sample.height
+        )
+        
+        try:
+            # Single-turn inference - no agent loop
+            response = evaluator.generate_response(
+                messages=[
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt}
+                ],
+                image=image,
+                refer_boxes=refer_boxes_tensor
+            )
+        except Exception as e:
+            if verbose:
+                logger.error(f"Error processing {sample.file_name}: {e}")
+            continue
+        
+        prediction = extract_action_from_response(response)
+        gt = clean_action_text(sample.gt_action)
+        pred_clean = clean_action_text(prediction)
+        
+        exact_match = pred_clean == gt
+        
+        result_entry = {
+            'sample_id': idx,
+            'file_name': sample.file_name,
+            'ground_truth': sample.gt_action,
+            'prediction': prediction,
+            'exact_match': exact_match,
+            'response': response,
+            'num_turns': 1,
+            'num_tool_calls': 0,
+            'tools_used': []
+        }
+        results.append(result_entry)
+        checkpoint_results.append(result_entry)
+        processed_count += 1
+        
+        # Save checkpoint every N samples
+        if output_dir and checkpoint_interval > 0 and processed_count % checkpoint_interval == 0:
+            save_checkpoint(output_dir, checkpoint_results, [], 'incremental')
+            logger.info(f"Checkpoint saved: {processed_count} samples processed")
+            checkpoint_results.clear()
+        
+        if verbose:
+            logger.info(f"Sample {idx}: GT='{gt}', Pred='{pred_clean}', Match={exact_match}")
+    
+    # Save any remaining results
+    if output_dir and checkpoint_results:
+        save_checkpoint(output_dir, checkpoint_results, [], 'incremental')
+        logger.info(f"Final checkpoint saved: {processed_count} total samples")
+    
+    return results, thinking_logs
+
+
 def evaluate_referring_batch(
     evaluator: SpatialHOIAgentEvaluator,
     samples: List[ReferringSample],
     img_prefix: str,
     save_thinking: bool = True,
-    verbose: bool = False
+    verbose: bool = False,
+    checkpoint_interval: int = 100,
+    output_dir: str = None,
+    completed_files: set = None
 ) -> Tuple[List[Dict], List[ThinkingLog]]:
-    """Evaluate referring task on a batch of samples."""
+    """Evaluate referring task on a batch of samples with incremental checkpointing."""
     results = []
     thinking_logs = []
+    completed_files = completed_files or set()
     
-    for idx, sample in enumerate(tqdm(samples, desc="Referring")):
+    # Track checkpoint progress  
+    checkpoint_results = []
+    checkpoint_thinking = []
+    processed_count = 0
+    
+    # Filter out already completed samples
+    samples_to_process = [(idx, s) for idx, s in enumerate(samples) if s.file_name not in completed_files]
+    if len(samples_to_process) < len(samples):
+        logger.info(f"Resuming: {len(samples) - len(samples_to_process)} already completed, {len(samples_to_process)} remaining")
+    
+    for idx, sample in tqdm(samples_to_process, desc="Referring"):
         image_path = os.path.join(img_prefix, sample.file_name)
         
         if not os.path.exists(image_path):
@@ -1144,9 +1445,25 @@ def evaluate_referring_batch(
                 metrics={'exact_match': exact_match}
             )
             thinking_logs.append(thinking_log)
+            checkpoint_thinking.append(thinking_log)
+        
+        checkpoint_results.append(result_entry)
+        processed_count += 1
+        
+        # Save checkpoint every N samples
+        if output_dir and checkpoint_interval > 0 and processed_count % checkpoint_interval == 0:
+            save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+            logger.info(f"Checkpoint saved: {processed_count} samples processed")
+            checkpoint_results.clear()
+            checkpoint_thinking.clear()
         
         if verbose:
             logger.info(f"Sample {idx}: GT='{gt}', Pred='{pred_clean}', Match={exact_match}")
+    
+    # Save any remaining results
+    if output_dir and checkpoint_results:
+        save_checkpoint(output_dir, checkpoint_results, checkpoint_thinking, 'incremental')
+        logger.info(f"Final checkpoint saved: {processed_count} total samples")
     
     return results, thinking_logs
 
@@ -1260,11 +1577,19 @@ def worker_evaluate_grounding(
     for d in samples_data:
         samples.append(GroundingSample(**d))
     
-    # Run evaluation
+    # Run evaluation with checkpointing
+    # Note: In multi-GPU mode, each worker saves checkpoints to a worker-specific file
+    worker_output_dir = args_dict.get('output_dir')
+    if worker_output_dir:
+        worker_output_dir = os.path.join(worker_output_dir, f'worker_{gpu_id}')
+        os.makedirs(worker_output_dir, exist_ok=True)
+    
     results, thinking_logs = evaluate_grounding_batch(
         evaluator, samples, args_dict['img_prefix'],
         save_thinking=args_dict.get('save_thinking', True),
-        verbose=args_dict.get('verbose', False)
+        verbose=args_dict.get('verbose', False),
+        checkpoint_interval=args_dict.get('checkpoint_interval', 100),
+        output_dir=worker_output_dir
     )
     
     # Convert thinking logs to dicts for serialization
@@ -1298,11 +1623,19 @@ def worker_evaluate_referring(
     for d in samples_data:
         samples.append(ReferringSample(**d))
     
-    # Run evaluation
+    # Run evaluation with checkpointing
+    # Note: In multi-GPU mode, each worker saves checkpoints to a worker-specific file
+    worker_output_dir = args_dict.get('output_dir')
+    if worker_output_dir:
+        worker_output_dir = os.path.join(worker_output_dir, f'worker_{gpu_id}')
+        os.makedirs(worker_output_dir, exist_ok=True)
+    
     results, thinking_logs = evaluate_referring_batch(
         evaluator, samples, args_dict['img_prefix'],
         save_thinking=args_dict.get('save_thinking', True),
-        verbose=args_dict.get('verbose', False)
+        verbose=args_dict.get('verbose', False),
+        checkpoint_interval=args_dict.get('checkpoint_interval', 100),
+        output_dir=worker_output_dir
     )
     
     # Convert thinking logs to dicts for serialization
@@ -1348,6 +1681,8 @@ def run_multi_gpu_evaluation(
         'verbose': args.verbose,
         'save_thinking': args.save_thinking,
         'enable_grounding_dino': args.enable_grounding_dino,
+        'checkpoint_interval': getattr(args, 'checkpoint_interval', 100),
+        'output_dir': args.output_dir,
     }
     
     # Split samples across GPUs
@@ -1598,6 +1933,8 @@ def main():
                         help="Device to run on")
     parser.add_argument("--max-turns", type=int, default=5,
                         help="Maximum agent turns (default: 5)")
+    parser.add_argument("--checkpoint-interval", type=int, default=100,
+                        help="Save checkpoint every N samples (default: 100)")
     
     # Evaluation options
     parser.add_argument("--max-images", type=int, default=None,
@@ -1616,6 +1953,10 @@ def main():
                         help="Enable Grounding DINO for object detection tool")
     parser.add_argument("--disable-grounding-dino", action="store_false", dest="enable_grounding_dino",
                         help="Disable Grounding DINO (return placeholder for detect_objects)")
+    
+    # Speed optimization options
+    parser.add_argument("--single-turn", action="store_true",
+                        help="Use single-turn inference (no tool calling) - MUCH faster for referring")
     
     # Metrics options
     parser.add_argument("--bertscore-gpu", type=int, default=0,
@@ -1641,6 +1982,7 @@ def main():
     
     # Handle resume mode
     previous_results = []
+    previous_thinking = []
     completed_files = set()
     if args.resume:
         if not os.path.exists(args.resume):
@@ -1649,7 +1991,7 @@ def main():
         # Use the resume directory as output directory
         args.output_dir = args.resume
         args.unique_run = False  # Don't generate new directory
-        previous_results, completed_files = load_previous_results(args.resume)
+        previous_results, previous_thinking, completed_files = load_previous_results(args.resume)
     elif args.unique_run:
         # Apply unique output directory if enabled and not resuming
         args.output_dir = get_unique_output_dir(args.output_dir)
@@ -1730,19 +2072,37 @@ def main():
             results, thinking_logs = evaluate_grounding_batch(
                 evaluator, samples, args.img_prefix,
                 save_thinking=args.save_thinking,
-                verbose=args.verbose
+                verbose=args.verbose,
+                checkpoint_interval=args.checkpoint_interval,
+                output_dir=args.output_dir,
+                completed_files=completed_files
+            )
+        elif getattr(args, 'single_turn', False):
+            # Fast single-turn evaluation (no tool calling)
+            logger.info("Using SINGLE-TURN mode (no tool calling) - faster inference")
+            results, thinking_logs = evaluate_referring_single_turn(
+                evaluator, samples, args.img_prefix,
+                verbose=args.verbose,
+                checkpoint_interval=args.checkpoint_interval,
+                output_dir=args.output_dir,
+                completed_files=completed_files
             )
         else:
             results, thinking_logs = evaluate_referring_batch(
                 evaluator, samples, args.img_prefix,
                 save_thinking=args.save_thinking,
-                verbose=args.verbose
+                verbose=args.verbose,
+                checkpoint_interval=args.checkpoint_interval,
+                output_dir=args.output_dir,
+                completed_files=completed_files
             )
     
     # Merge with previous results if resuming
     if previous_results:
         logger.info(f"Merging {len(results)} new results with {len(previous_results)} previous results")
         results = previous_results + results
+        if previous_thinking:
+            thinking_logs = previous_thinking + thinking_logs
         logger.info(f"Total results: {len(results)}")
     
     # Compute metrics
